@@ -1,10 +1,12 @@
 use ergot::{
     Address,
+    interface_manager::InterfaceState,
+    interface_manager::Profile,
     interface_manager::interface_impls::nusb_bulk::DeviceInfo as ErgotDeviceInfo,
     toolkits::nusb_v0_1::{RouterStack, find_new_devices, register_router_interface},
 };
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
-use log::{error, info, trace};
+use log::{error, info, trace, warn};
 use std::{collections::HashSet, io, pin::pin, time::Duration};
 use tokio::time::sleep;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
@@ -13,6 +15,9 @@ const MTU: u16 = 2048;
 const OUT_BUFFER_SIZE: usize = 16384;
 // 1492-byte WiFi MTU minus 14-byte Ethernet header.
 const TAP_MTU: u16 = 1478;
+const ESP32_NODE_ID: u8 = 2;
+const MAC_QUERY_RETRIES: usize = 10;
+const MAC_QUERY_RETRY_DELAY_MS: u64 = 300;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -22,42 +27,36 @@ async fn main() -> io::Result<()> {
     // Wait for ESP32 to connect
     info!("Waiting for ESP32 device...");
     let mut seen = HashSet::new();
-    loop {
+    let expected_mac = loop {
         let registered = reconcile_and_register_devices(&stack, &mut seen).await;
-        if registered {
-            break;
+        if let Some((iface, _info)) = registered.first() {
+            // Give device time to initialize
+            sleep(Duration::from_secs(2)).await;
+            let mac = query_mac_with_retry(&stack, *iface).await?;
+            break mac;
         }
         sleep(Duration::from_millis(500)).await;
-    }
-
-    // Give device time to initialize
-    sleep(Duration::from_secs(2)).await;
-
-    // Query WiFi MAC from ESP32
-    info!("Querying WiFi MAC from ESP32...");
-    let nets = stack.manage_profile(|im| im.get_nets());
-    let net = nets.first().expect("No network found");
-    let addr = Address {
-        network_id: *net,
-        node_id: 2,
-        port_id: 0,
     };
-
-    let mac = stack
-        .endpoints()
-        .request::<GetMacEndpoint>(addr, &(), Some("mac"))
-        .await
-        .expect("Failed to get MAC address");
 
     info!(
         "ESP32 WiFi MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        expected_mac[0],
+        expected_mac[1],
+        expected_mac[2],
+        expected_mac[3],
+        expected_mac[4],
+        expected_mac[5]
     );
 
     // Create TAP interface with ESP32's WiFi MAC
     let mac_str = format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        expected_mac[0],
+        expected_mac[1],
+        expected_mac[2],
+        expected_mac[3],
+        expected_mac[4],
+        expected_mac[5]
     );
 
     let tap_device = DeviceBuilder::new()
@@ -87,7 +86,28 @@ async fn main() -> io::Result<()> {
 
     // Keep watching for new devices (in case of reconnection)
     loop {
-        reconcile_and_register_devices(&stack, &mut seen).await;
+        let registered = reconcile_and_register_devices(&stack, &mut seen).await;
+        if !registered.is_empty() {
+            sleep(Duration::from_secs(2)).await;
+        }
+        for (iface, info) in registered {
+            match query_mac_with_retry(&stack, iface).await {
+                Ok(mac) => {
+                    if mac != expected_mac {
+                        panic!(
+                            "ESP32 MAC changed after reconnect: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to query MAC after reconnect for {:?}: {:?}",
+                        info, err
+                    );
+                }
+            }
+        }
 
         sleep(Duration::from_secs(3)).await;
     }
@@ -129,21 +149,21 @@ fn coarse_device_filter(info: &nusb::DeviceInfo) -> bool {
 async fn reconcile_and_register_devices(
     stack: &RouterStack,
     seen: &mut HashSet<ErgotDeviceInfo>,
-) -> bool {
+) -> Vec<(u64, ErgotDeviceInfo)> {
     if let Some(connected) = current_device_infos() {
         seen.retain(|info| connected.contains(info));
     }
 
     let devices = find_new_devices(seen).await;
-    let mut registered = false;
+    let mut registered = Vec::new();
 
     for dev in devices {
         let info = dev.info.clone();
         info!("Found {:?}, registering", info);
         match register_router_interface(stack, dev, MTU, OUT_BUFFER_SIZE).await {
-            Ok(_ident) => {
-                seen.insert(info);
-                registered = true;
+            Ok(ident) => {
+                seen.insert(info.clone());
+                registered.push((ident, info));
             }
             Err(err) => {
                 error!("Failed to register {:?}: {:?}", info, err);
@@ -152,6 +172,47 @@ async fn reconcile_and_register_devices(
     }
 
     registered
+}
+
+async fn query_mac_with_retry(stack: &RouterStack, interface_id: u64) -> io::Result<[u8; 6]> {
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 1..=MAC_QUERY_RETRIES {
+        info!(
+            "Querying WiFi MAC from ESP32 (attempt {}/{})...",
+            attempt, MAC_QUERY_RETRIES
+        );
+        match query_mac_for_interface(stack, interface_id).await {
+            Ok(mac) => return Ok(mac),
+            Err(err) => {
+                last_err = Some(err);
+                sleep(Duration::from_millis(MAC_QUERY_RETRY_DELAY_MS)).await;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| io::Error::other("Failed to query ESP32 MAC")))
+}
+
+async fn query_mac_for_interface(stack: &RouterStack, interface_id: u64) -> io::Result<[u8; 6]> {
+    let net_id = stack
+        .manage_profile(|im| im.interface_state(interface_id))
+        .and_then(|state| match state {
+            InterfaceState::Active { net_id, node_id: _ } => Some(net_id),
+            _ => None,
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No active interface"))?;
+
+    let addr = Address {
+        network_id: net_id,
+        node_id: ESP32_NODE_ID,
+        port_id: 0,
+    };
+
+    stack
+        .endpoints()
+        .request::<GetMacEndpoint>(addr, &(), Some("mac"))
+        .await
+        .map_err(|err| io::Error::other(format!("{:?}", err)))
 }
 
 async fn ping_listener(stack: RouterStack) {
