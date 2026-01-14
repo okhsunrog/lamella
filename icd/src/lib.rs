@@ -1,39 +1,27 @@
 #![no_std]
 
 use ergot::{endpoint, topic};
+use heapless::Vec;
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 
-// LED control endpoint
-endpoint!(LedEndpoint, bool, (), "led/set");
+// Maximum Ethernet frame size (MTU 1500 + headers)
+pub const MAX_FRAME_SIZE: usize = 1514;
+
+// Get WiFi MAC address from ESP32
+endpoint!(GetMacEndpoint, (), [u8; 6], "wifi/mac");
+
+// Ethernet frame from WiFi to host (ESP32-S3 -> Host)
+#[derive(Serialize, Deserialize, Schema, Clone, Debug)]
+pub struct WifiFrame {
+    pub data: Vec<u8, MAX_FRAME_SIZE>,
+}
+
+// Topic for frames coming from WiFi (ESP32-S3 publishes, host subscribes)
+topic!(WifiRxTopic, WifiFrame, "wifi/rx");
+
+// Topic for frames going to WiFi (host publishes, ESP32-S3 subscribes)
+topic!(WifiTxTopic, WifiFrame, "wifi/tx");
 
 // Ping topic for testing
 topic!(PingTopic, u64, "ping/data");
-
-// Example data structure for network status
-#[derive(Serialize, Deserialize, Schema, Default, Clone, Debug)]
-pub struct NetworkStatus {
-    pub connected: bool,
-    pub ip_address: [u8; 4],
-    pub packets_rx: u32,
-    pub packets_tx: u32,
-}
-
-topic!(NetworkStatusTopic, NetworkStatus, "network/status");
-
-// Generic command endpoint
-#[derive(Serialize, Deserialize, Schema, Clone, Debug)]
-pub enum Command {
-    Reset,
-    GetStatus,
-    SetConfig { key: u8, value: u32 },
-}
-
-#[derive(Serialize, Deserialize, Schema, Clone, Debug)]
-pub enum CommandResponse {
-    Ok,
-    Error(u8),
-    Status(NetworkStatus),
-}
-
-endpoint!(CommandEndpoint, Command, CommandResponse, "cmd");

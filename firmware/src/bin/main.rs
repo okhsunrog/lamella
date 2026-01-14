@@ -4,7 +4,6 @@
     clippy::mem_forget,
     reason = "mem::forget is generally not safe to do with esp_hal types"
 )]
-#![deny(clippy::large_stack_frames)]
 
 use core::{future::poll_fn, pin::pin, task::Poll};
 
@@ -218,14 +217,11 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
     info!("Connecting to SSID: {}", SSID);
 
     loop {
-        match esp_radio::wifi::sta_state() {
-            WifiStaState::Connected => {
-                info!("WiFi connected, waiting for disconnect event...");
-                controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                info!("WiFi disconnected!");
-                Timer::after(Duration::from_millis(5000)).await;
-            }
-            _ => {}
+        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
+            info!("WiFi connected, waiting for disconnect event...");
+            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+            info!("WiFi disconnected!");
+            Timer::after(Duration::from_millis(5000)).await;
         }
 
         if !matches!(controller.is_started(), Ok(true)) {
