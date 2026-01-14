@@ -11,7 +11,6 @@ pub const MAX_FRAME_SIZE: usize = 1514;
 // Get WiFi MAC address from ESP32
 endpoint!(GetMacEndpoint, (), [u8; 6], "wifi/mac");
 
-// Ethernet frame from WiFi to host (ESP32-S3 -> Host)
 #[derive(Serialize, Deserialize, Schema, Clone, Debug)]
 pub struct WifiFrame {
     pub data: Vec<u8, MAX_FRAME_SIZE>,

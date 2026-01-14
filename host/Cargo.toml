@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ergot = { git = "https://github.com/jamesmunns/ergot", features = ["nusb-v0_1"] }
+ergot = { git = "https://github.com/okhsunrog/ergot", branch = "async-backpressure", features = ["nusb-v0_1", "tokio-serial-v5"] }
 icd = { path = "../icd" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 log = "0.4"
@@ -14,3 +14,5 @@ serde = "1.0"
 heapless = "0.9"
 tun-rs = { version = "2.7.7", features = ["async"] }
 nusb = "0.1.14"
+clap = { version = "4.5.54", features = ["derive"] }
+tokio-serial = "5.4.5"

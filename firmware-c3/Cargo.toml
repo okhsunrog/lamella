@@ -1,0 +1,83 @@
+[package]
+edition = "2024"
+name = "firmware-c3"
+rust-version = "1.88"
+version = "0.1.0"
+
+[[bin]]
+name = "firmware-c3"
+path = "./src/bin/main.rs"
+test = false
+
+[[test]]
+harness = false
+name = "hello_test"
+
+[lib]
+test = false
+
+[dependencies]
+esp-hal = { version = "~1.0", features = ["defmt", "esp32c3", "unstable"] }
+
+esp-rtos = { version = "0.2.0", features = [
+    "defmt",
+    "embassy",
+    "esp-alloc",
+    "esp-radio",
+    "esp32c3",
+] }
+
+defmt = "1.0.1"
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c3"] }
+
+esp-alloc = { version = "0.9.0", features = ["defmt"] }
+panic-rtt-target = { version = "0.2.0", features = ["defmt"] }
+rtt-target = { version = "0.6.2", features = ["defmt"] }
+
+embassy-executor = { version = "0.9.1", features = ["defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt"] }
+embassy-futures = "0.1"
+embassy-net-driver = "0.2.0"
+
+esp-radio = { version = "0.17.0", features = [
+    "defmt",
+    "esp-alloc",
+    "esp32c3",
+    "unstable",
+    "wifi",
+] }
+
+# Ergot and related
+ergot = { git = "https://github.com/okhsunrog/ergot", branch = "async-backpressure", features = [
+    "embedded-io-async-v0_6",
+    "defmt-v1",
+] }
+bbq2 = { version = "0.4", default-features = false, features = ["maitake-sync-0_2", "critical-section"] }
+mutex = { version = "1.0", features = ["impl-critical-section"] }
+maitake-sync = { version = "0.2", default-features = false }
+
+# ICD
+icd = { path = "../icd" }
+
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+heapless = "0.9.2"
+
+[dev-dependencies]
+embedded-test = { version = "0.7.0", features = [
+    "defmt",
+    "embassy",
+    "external-executor",
+] }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false

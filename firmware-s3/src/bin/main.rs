@@ -14,6 +14,7 @@ use embassy_time::{Duration, Timer};
 use embassy_usb::{UsbDevice, driver::Driver};
 use ergot::{
     exports::bbq2::{prod_cons::framed::FramedConsumer, traits::coordination::cs::CsCoord},
+    interface_manager::{InterfaceState, Profile},
     toolkits::embassy_usb_v0_5 as kit,
 };
 use esp_backtrace as _;
@@ -26,8 +27,8 @@ use esp_radio::wifi::{
     ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
 };
 use heapless::Vec as HVec;
-use icd::{GetMacEndpoint, MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
-use log::{info, trace};
+use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxTopic};
+use log::info;
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
 use static_cell::{ConstStaticCell, StaticCell};
 
@@ -38,7 +39,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
 
-const OUT_QUEUE_SIZE: usize = 16384;
+const OUT_QUEUE_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
 const MAX_PACKET_SIZE: usize = 2048;
 
 // ESP32-S3 USB OTG driver type
@@ -145,7 +146,6 @@ async fn main(spawner: Spawner) -> ! {
     spawner.must_spawn(run_tx(tx_impl, OUTQ.framed_consumer()));
     spawner.must_spawn(run_rx(rxvr, RX_BUF.take()));
     spawner.must_spawn(pingserver());
-    spawner.must_spawn(ping_broadcaster());
     spawner.must_spawn(wifi_connection(wifi_controller));
     spawner.must_spawn(mac_server(wifi_mac));
     spawner.must_spawn(wifi_bridge(interfaces.sta));
@@ -200,18 +200,6 @@ async fn mac_server(mac: [u8; 6]) {
 }
 
 #[task]
-async fn ping_broadcaster() {
-    let mut ctr: u64 = 0;
-    Timer::after(Duration::from_secs(3)).await;
-    loop {
-        Timer::after(Duration::from_secs(5)).await;
-        trace!("Sending ping broadcast: {}", ctr);
-        let _ = STACK.topics().broadcast::<PingTopic>(&ctr, None);
-        ctr += 1;
-    }
-}
-
-#[task]
 async fn wifi_connection(mut controller: WifiController<'static>) {
     info!("WiFi connection task started");
     info!("Connecting to SSID: {}", SSID);
@@ -247,6 +235,19 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
     }
 }
 
+async fn wait_for_outq_space() {
+    // Use the stack MTU since ergot reserves full MTU-sized grants per frame.
+    let grant = OUTQ
+        .framed_producer()
+        .wait_grant(MAX_PACKET_SIZE as u16)
+        .await;
+    grant.abort();
+}
+
+fn try_broadcast_wifi_frame(frame: &WifiFrame) -> bool {
+    STACK.topics().broadcast::<WifiRxTopic>(frame, None).is_ok()
+}
+
 /// Bidirectional WiFi bridge - forwards frames between WiFi and ergot/USB
 #[task]
 async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
@@ -254,20 +255,69 @@ async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
 
     // Wait for WiFi to connect
     loop {
-        if matches!(esp_radio::wifi::sta_state(), WifiStaState::Connected) {
+        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
             break;
         }
         Timer::after(Duration::from_millis(100)).await;
     }
+    info!("WiFi connected");
 
-    info!("WiFi connected, starting bidirectional frame bridge");
+    // Wait for ergot/USB connection to be established (network ID assigned)
+    info!("Waiting for USB/ergot connection...");
+    loop {
+        let is_active = STACK.manage_profile(|im| {
+            matches!(im.interface_state(()), Some(InterfaceState::Active { .. }))
+        });
+        if is_active {
+            break;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+    info!("Ergot connection established, starting bidirectional frame bridge");
 
     // Subscribe to frames from host
     let subber = STACK.topics().bounded_receiver::<WifiTxTopic, 16>(None);
     let subber = pin!(subber);
     let mut host_rx = subber.subscribe();
 
+    let mut pending_wifi_frame: Option<WifiFrame> = None;
+
     loop {
+        if let Some(frame) = pending_wifi_frame.take() {
+            if try_broadcast_wifi_frame(&frame) {
+                continue;
+            }
+
+            // Backpressure: wait for USB/ergot TX queue space while still handling host->WiFi.
+            match select(wait_for_outq_space(), host_rx.recv()).await {
+                Either::First(()) => {
+                    pending_wifi_frame = Some(frame);
+                }
+                Either::Second(msg) => {
+                    if let Some(tx_token) = wifi_device.transmit() {
+                        tx_token.consume_token(msg.t.data.len(), |buffer| {
+                            buffer.copy_from_slice(&msg.t.data);
+                        });
+                    }
+                    pending_wifi_frame = Some(frame);
+                }
+            }
+            continue;
+        }
+
+        // Ensure there is room in the USB TX queue before pulling another WiFi frame.
+        match select(wait_for_outq_space(), host_rx.recv()).await {
+            Either::First(()) => {}
+            Either::Second(msg) => {
+                if let Some(tx_token) = wifi_device.transmit() {
+                    tx_token.consume_token(msg.t.data.len(), |buffer| {
+                        buffer.copy_from_slice(&msg.t.data);
+                    });
+                }
+                continue;
+            }
+        }
+
         // Create futures for WiFi RX and host TX
         let wifi_rx_fut = poll_fn(|cx| {
             if let Some((rx_token, _tx_token)) = NetDriver::receive(&mut wifi_device, cx) {
@@ -283,14 +333,18 @@ async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
         match select(wifi_rx_fut, host_tx_fut).await {
             Either::First(Some(rx_token)) => {
                 // WiFi -> Host: forward received frame to ergot
+                let mut frame_opt = None;
                 rx_token.consume_token(|buffer| {
-                    // info!("WiFi->USB: {} bytes", buffer.len());
                     let mut frame_data = HVec::<u8, MAX_FRAME_SIZE>::new();
                     if frame_data.extend_from_slice(buffer).is_ok() {
-                        let frame = WifiFrame { data: frame_data };
-                        let _ = STACK.topics().broadcast::<WifiRxTopic>(&frame, None);
+                        frame_opt = Some(WifiFrame { data: frame_data });
                     }
                 });
+                if let Some(frame) = frame_opt {
+                    if !try_broadcast_wifi_frame(&frame) {
+                        pending_wifi_frame = Some(frame);
+                    }
+                }
             }
             Either::First(None) => {
                 // No RX token, shouldn't happen after Ready
