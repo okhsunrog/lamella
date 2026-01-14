@@ -1,5 +1,6 @@
 use ergot::{
     Address,
+    interface_manager::interface_impls::nusb_bulk::DeviceInfo as ErgotDeviceInfo,
     toolkits::nusb_v0_1::{RouterStack, find_new_devices, register_router_interface},
 };
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
@@ -22,16 +23,8 @@ async fn main() -> io::Result<()> {
     info!("Waiting for ESP32 device...");
     let mut seen = HashSet::new();
     loop {
-        let devices = find_new_devices(&seen).await;
-        if !devices.is_empty() {
-            for dev in devices {
-                let info = dev.info.clone();
-                info!("Found {:?}, registering", info);
-                let _hdl = register_router_interface(&stack, dev, MTU, OUT_BUFFER_SIZE)
-                    .await
-                    .unwrap();
-                seen.insert(info);
-            }
+        let registered = reconcile_and_register_devices(&stack, &mut seen).await;
+        if registered {
             break;
         }
         sleep(Duration::from_millis(500)).await;
@@ -94,19 +87,71 @@ async fn main() -> io::Result<()> {
 
     // Keep watching for new devices (in case of reconnection)
     loop {
-        let devices = find_new_devices(&seen).await;
-
-        for dev in devices {
-            let info = dev.info.clone();
-            info!("Found {:?}, registering", info);
-            let _hdl = register_router_interface(&stack, dev, MTU, OUT_BUFFER_SIZE)
-                .await
-                .unwrap();
-            seen.insert(info);
-        }
+        reconcile_and_register_devices(&stack, &mut seen).await;
 
         sleep(Duration::from_secs(3)).await;
     }
+}
+
+fn current_device_infos() -> Option<HashSet<ErgotDeviceInfo>> {
+    let devices = match nusb::list_devices() {
+        Ok(devices) => devices,
+        Err(err) => {
+            error!("Failed listing USB devices: {:?}", err);
+            return None;
+        }
+    };
+
+    let mut out = HashSet::new();
+    for device in devices.filter(coarse_device_filter) {
+        out.insert(ErgotDeviceInfo {
+            usb_serial_number: device.serial_number().map(String::from),
+            usb_manufacturer: device.manufacturer_string().map(String::from),
+            usb_product: device.product_string().map(String::from),
+        });
+    }
+    Some(out)
+}
+
+fn coarse_device_filter(info: &nusb::DeviceInfo) -> bool {
+    info.interfaces().any(|intfc| {
+        let pre_check =
+            intfc.class() == 0xFF && intfc.subclass() == 0xCA && intfc.protocol() == 0x7D;
+
+        pre_check
+            && intfc
+                .interface_string()
+                .map(|s| s == "ergot")
+                .unwrap_or(true)
+    })
+}
+
+async fn reconcile_and_register_devices(
+    stack: &RouterStack,
+    seen: &mut HashSet<ErgotDeviceInfo>,
+) -> bool {
+    if let Some(connected) = current_device_infos() {
+        seen.retain(|info| connected.contains(info));
+    }
+
+    let devices = find_new_devices(seen).await;
+    let mut registered = false;
+
+    for dev in devices {
+        let info = dev.info.clone();
+        info!("Found {:?}, registering", info);
+        match register_router_interface(stack, dev, MTU, OUT_BUFFER_SIZE).await {
+            Ok(_ident) => {
+                seen.insert(info);
+                registered = true;
+            }
+            Err(err) => {
+                error!("Failed to register {:?}: {:?}", info, err);
+            }
+        }
+    }
+
+    registered
 }
 
 async fn ping_listener(stack: RouterStack) {

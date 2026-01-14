@@ -638,6 +638,7 @@ dependencies = [
  "heapless 0.9.2",
  "icd",
  "log",
+ "nusb",
  "postcard-schema",
  "serde",
  "tokio",

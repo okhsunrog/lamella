@@ -13,3 +13,4 @@ postcard-schema = { version = "0.2", features = ["derive"] }
 serde = "1.0"
 heapless = "0.9"
 tun-rs = { version = "2.7.7", features = ["async"] }
+nusb = "0.1.14"
