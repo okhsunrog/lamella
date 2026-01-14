@@ -1,17 +1,11 @@
 use ergot::{
     Address,
     toolkits::nusb_v0_1::{RouterStack, find_new_devices, register_router_interface},
-    well_known::ErgotPingEndpoint,
 };
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
 use log::{error, info, trace};
-use std::{
-    collections::HashSet,
-    io,
-    pin::pin,
-    time::{Duration, Instant},
-};
-use tokio::time::{interval, sleep, timeout};
+use std::{collections::HashSet, io, pin::pin, time::Duration};
+use tokio::time::sleep;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 
 const MTU: u16 = 2048;
@@ -94,7 +88,6 @@ async fn main() -> io::Result<()> {
     // Wrap in Arc for sharing between tasks
     let tap_device = std::sync::Arc::new(tap_device);
 
-    // tokio::task::spawn(ping_all(stack.clone()));
     tokio::task::spawn(ping_listener(stack.clone()));
     tokio::task::spawn(tap_to_wifi(stack.clone(), tap_device.clone()));
     tokio::task::spawn(wifi_to_tap(stack.clone(), tap_device.clone()));
@@ -113,40 +106,6 @@ async fn main() -> io::Result<()> {
         }
 
         sleep(Duration::from_secs(3)).await;
-    }
-}
-
-async fn ping_all(stack: RouterStack) {
-    let mut ival = interval(Duration::from_secs(3));
-    let mut ctr = 0u32;
-
-    loop {
-        ival.tick().await;
-        let nets = stack.manage_profile(|im| im.get_nets());
-        trace!("Nets to ping: {:?}", nets);
-
-        for net in nets {
-            let pg = ctr;
-            ctr = ctr.wrapping_add(1);
-
-            let addr = Address {
-                network_id: net,
-                node_id: 2,
-                port_id: 0,
-            };
-
-            let start = Instant::now();
-            let rr = stack
-                .endpoints()
-                .request_full::<ErgotPingEndpoint>(addr, &pg, None);
-            let fut = timeout(Duration::from_millis(100), rr);
-            let res = fut.await;
-            let elapsed = start.elapsed();
-            match &res {
-                Ok(Ok(_)) => trace!("ping {}.2: {:?}", net, elapsed),
-                _ => trace!("ping {}.2 failed: {:?}", net, res),
-            }
-        }
     }
 }
 
