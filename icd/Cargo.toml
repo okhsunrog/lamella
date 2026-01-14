@@ -1,0 +1,9 @@
+[package]
+name = "icd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ergot = { git = "https://github.com/jamesmunns/ergot" }
+postcard-schema = { version = "0.2", features = ["derive"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
