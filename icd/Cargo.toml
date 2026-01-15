@@ -2,9 +2,10 @@
 name = "icd"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-ergot = { git = "https://github.com/okhsunrog/ergot", branch = "async-backpressure" }
+ergot = { git = "https://github.com/okhsunrog/ergot", branch = "for_lamella" }
 postcard-schema = { version = "0.2", features = ["derive", "heapless-v0_9"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 heapless = { version = "0.9", features = ["serde"] }

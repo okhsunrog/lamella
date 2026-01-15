@@ -3,6 +3,8 @@ edition = "2024"
 name = "firmware-s3"
 rust-version = "1.88"
 version = "0.1.0"
+authors = ["Danila Gornushko"]
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "firmware"
@@ -44,7 +46,7 @@ esp-radio = { version = "0.17.0", features = [
 ] }
 
 # Ergot and related
-ergot = { git = "https://github.com/okhsunrog/ergot", branch = "async-backpressure", features = [
+ergot = { git = "https://github.com/okhsunrog/ergot", branch = "for_lamella", features = [
     "embassy-usb-v0_5",
 ] }
 bbq2 = { version = "0.4", default-features = false, features = ["maitake-sync-0_2", "critical-section"] }

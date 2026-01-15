@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "cobs-acc"
 version = "0.1.0"
-source = "git+https://github.com/okhsunrog/ergot?branch=async-backpressure#b9b73909c2779a089c9cfded6120c49051dd4676"
+source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d32d9508509b2409823e26ed24516e9ae57f627e"
 dependencies = [
  "cobs 0.4.0",
 ]
@@ -471,7 +471,7 @@ dependencies = [
 [[package]]
 name = "ergot"
 version = "0.12.0"
-source = "git+https://github.com/okhsunrog/ergot?branch=async-backpressure#b9b73909c2779a089c9cfded6120c49051dd4676"
+source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d32d9508509b2409823e26ed24516e9ae57f627e"
 dependencies = [
  "bbq2",
  "cobs 0.3.0",

@@ -10,6 +10,7 @@ const TAP_MTU: u16 = 1478; // 1492-byte WiFi MTU minus 14-byte Ethernet header
 const ESP32_NODE_ID: u8 = 2;
 const MAC_QUERY_RETRIES: usize = 10;
 const MAC_QUERY_RETRY_DELAY_MS: u64 = 300;
+const MAC_QUERY_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Parser)]
 #[command(name = "network-via-tap")]

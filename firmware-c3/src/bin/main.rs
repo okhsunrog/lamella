@@ -7,14 +7,17 @@
 
 use core::{future::poll_fn, pin::pin, task::Poll};
 
-use defmt::info;
+use defmt::{info, warn};
 use embassy_executor::{task, Spawner};
 use embassy_futures::select::{select, Either};
 use embassy_net_driver::Driver as NetDriver;
 use embassy_time::{Duration, Timer};
+use embedded_io_async_0_7::Write;
 use ergot::{
     exports::bbq2::traits::coordination::cs::CsCoord,
-    toolkits::embedded_io_async_v0_6::{self as kit, tx_worker},
+    interface_manager::InterfaceState,
+    interface_manager::Profile,
+    toolkits::embedded_io_async_v0_7::{self as kit},
 };
 use esp_hal::{
     Async,
@@ -38,6 +41,7 @@ const PASSWORD: &str = env!("WIFI_PASSWORD");
 
 const OUT_QUEUE_SIZE: usize = 16384;
 const MAX_PACKET_SIZE: usize = 2048;
+const SERIAL_TX_TIMEOUT_MS: u64 = 2000;
 
 // ESP32-C3 USB Serial/JTAG driver type
 type AppDriver = UsbSerialJtagRx<'static, Async>;
@@ -122,8 +126,26 @@ async fn run_rx(mut rcvr: RxWorker, recv_buf: &'static mut [u8], scratch_buf: &'
 /// Worker task for outgoing data
 #[task]
 async fn run_tx(mut tx: UsbSerialJtagTx<'static, Async>) {
+    let rx = OUTQ.stream_consumer();
     loop {
-        _ = tx_worker(&mut tx, OUTQ.stream_consumer()).await;
+        let data = rx.wait_read().await;
+        let len = data.len();
+        let write_fut = Write::write(&mut tx, &data);
+        match select(write_fut, Timer::after_millis(SERIAL_TX_TIMEOUT_MS)).await {
+            Either::First(res) => {
+                match res {
+                    Ok(used) => data.release(used),
+                    Err(_) => {
+                        warn!("Serial TX error");
+                        data.release(len);
+                    }
+                }
+            }
+            Either::Second(()) => {
+                warn!("Serial TX timeout, dropping {} bytes", len);
+                data.release(len);
+            }
+        }
     }
 }
 
@@ -211,7 +233,20 @@ async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
         Timer::after(Duration::from_millis(100)).await;
     }
 
-    info!("WiFi connected, starting bidirectional frame bridge");
+    info!("WiFi connected");
+
+    // Wait for ergot/USB connection to be established (network ID assigned)
+    info!("Waiting for USB/ergot connection...");
+    loop {
+        let is_active = STACK.manage_profile(|im| {
+            matches!(im.interface_state(()), Some(InterfaceState::Active { .. }))
+        });
+        if is_active {
+            break;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+    info!("Ergot connection established, starting bidirectional frame bridge");
 
     // Subscribe to frames from host
     let subber = STACK.topics().bounded_receiver::<WifiTxTopic, 16>(None);

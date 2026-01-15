@@ -10,11 +10,12 @@ use ergot::{
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
 use log::{error, info, trace, warn};
 use std::{collections::HashSet, io, pin::pin, time::Duration};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tun_rs::AsyncDevice;
 
 use crate::{
-    ESP32_NODE_ID, MAC_QUERY_RETRIES, MAC_QUERY_RETRY_DELAY_MS, create_tap_interface, log_mac,
+    ESP32_NODE_ID, MAC_QUERY_RETRIES, MAC_QUERY_RETRY_DELAY_MS, MAC_QUERY_TIMEOUT_MS,
+    create_tap_interface, log_mac,
 };
 
 const MTU: u16 = 2048;
@@ -143,13 +144,24 @@ async fn query_mac_with_retry(stack: &RouterStack, interface_id: u64) -> io::Res
             "Querying WiFi MAC from ESP32 (attempt {}/{})...",
             attempt, MAC_QUERY_RETRIES
         );
-        match query_mac_for_interface(stack, interface_id).await {
-            Ok(mac) => return Ok(mac),
-            Err(err) => {
+        match timeout(
+            Duration::from_millis(MAC_QUERY_TIMEOUT_MS),
+            query_mac_for_interface(stack, interface_id),
+        )
+        .await
+        {
+            Ok(Ok(mac)) => return Ok(mac),
+            Ok(Err(err)) => {
                 last_err = Some(err);
-                sleep(Duration::from_millis(MAC_QUERY_RETRY_DELAY_MS)).await;
+            }
+            Err(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Timed out waiting for ESP32 MAC response",
+                ));
             }
         }
+        sleep(Duration::from_millis(MAC_QUERY_RETRY_DELAY_MS)).await;
     }
 
     Err(last_err.unwrap_or_else(|| io::Error::other("Failed to query ESP32 MAC")))

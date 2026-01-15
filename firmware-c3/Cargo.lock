@@ -178,7 +178,7 @@ dependencies = [
 [[package]]
 name = "cobs-acc"
 version = "0.1.0"
-source = "git+https://github.com/jamesmunns/ergot#cd3bbb760de00180dfa3150af132cacc9b4561e3"
+source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d32d9508509b2409823e26ed24516e9ae57f627e"
 dependencies = [
  "cobs 0.4.0",
 ]
@@ -772,7 +772,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "ergot"
 version = "0.12.0"
-source = "git+https://github.com/jamesmunns/ergot#cd3bbb760de00180dfa3150af132cacc9b4561e3"
+source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d32d9508509b2409823e26ed24516e9ae57f627e"
 dependencies = [
  "bbq2",
  "cobs 0.3.0",
@@ -1143,6 +1143,7 @@ dependencies = [
  "embassy-futures",
  "embassy-net-driver",
  "embassy-time",
+ "embedded-io-async 0.7.0",
  "embedded-test",
  "ergot",
  "esp-alloc",

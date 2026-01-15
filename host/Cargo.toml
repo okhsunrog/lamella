@@ -2,9 +2,10 @@
 name = "host"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-ergot = { git = "https://github.com/okhsunrog/ergot", branch = "async-backpressure", features = ["nusb-v0_1", "tokio-serial-v5"] }
+ergot = { git = "https://github.com/okhsunrog/ergot", branch = "for_lamella", features = ["nusb-v0_1", "tokio-serial-v5"] }
 icd = { path = "../icd" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 log = "0.4"
