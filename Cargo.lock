@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "cobs-acc"
 version = "0.1.0"
-source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d32d9508509b2409823e26ed24516e9ae57f627e"
+source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d8814c2269a4dc6b9503c6fcc77809808c375539"
 dependencies = [
  "cobs 0.4.0",
 ]
@@ -471,7 +471,7 @@ dependencies = [
 [[package]]
 name = "ergot"
 version = "0.12.0"
-source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d32d9508509b2409823e26ed24516e9ae57f627e"
+source = "git+https://github.com/okhsunrog/ergot?branch=for_lamella#d8814c2269a4dc6b9503c6fcc77809808c375539"
 dependencies = [
  "bbq2",
  "cobs 0.3.0",

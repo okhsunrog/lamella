@@ -2,5 +2,7 @@
 resolver = "2"
 members = ["host", "icd"]
 exclude = ["firmware-s3", "firmware-c3"]
+
+[workspace.package]
 license = "MIT OR Apache-2.0"
 authors = ["Danila Gornushko"]

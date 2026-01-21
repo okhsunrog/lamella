@@ -52,10 +52,10 @@ type Stack = kit::Stack<&'static Queue, CriticalSectionRawMutex>;
 // The type of our outgoing queue
 type Queue = kit::Queue<OUT_QUEUE_SIZE, CsCoord>;
 
-/// Statically store our netstack
-static STACK: Stack = kit::new_target_stack(OUTQ.stream_producer(), MAX_PACKET_SIZE as u16);
 /// Statically store our outgoing packet buffer
 static OUTQ: Queue = kit::Queue::new();
+/// Statically store our netstack
+static STACK: Stack = kit::new_target_stack(OUTQ.stream_producer(), Some(&OUTQ), MAX_PACKET_SIZE as u16);
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {

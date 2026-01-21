@@ -51,12 +51,12 @@ type Stack = kit::Stack<&'static Queue, CriticalSectionRawMutex>;
 // The type of our outgoing queue
 type Queue = kit::Queue<OUT_QUEUE_SIZE, CsCoord>;
 
-/// Statically store our netstack
-static STACK: Stack = kit::new_target_stack(OUTQ.framed_producer(), MAX_PACKET_SIZE as u16);
-/// Statically store our USB app buffers
-static STORAGE: kit::WireStorage<256, 256, 64, 256> = kit::WireStorage::new();
 /// Statically store our outgoing packet buffer
 static OUTQ: Queue = kit::Queue::new();
+/// Statically store our netstack
+static STACK: Stack = kit::new_target_stack(OUTQ.framed_producer(), Some(&OUTQ), MAX_PACKET_SIZE as u16);
+/// Statically store our USB app buffers
+static STORAGE: kit::WireStorage<256, 256, 64, 256> = kit::WireStorage::new();
 
 fn usb_config(serial: &'static str) -> embassy_usb::Config<'static> {
     let mut config = embassy_usb::Config::new(0x16c0, 0x27DD);
