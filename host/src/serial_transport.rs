@@ -1,40 +1,38 @@
 //! Serial transport for ESP32-C3 with USB Serial/JTAG
 
-use ergot::{
-    Address,
-    interface_manager::InterfaceState,
-    interface_manager::Profile,
-    toolkits::tokio_serial_v5::{RouterStack, register_router_interface},
-};
-use icd::{GetMacEndpoint, MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
+use ergot::toolkits::tokio_serial_v5::{RouterStack, register_router_interface};
+use icd::{MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
 use log::{error, info, trace, warn};
-use std::{io, path::Path, pin::pin, time::Duration};
-use tokio::time::{sleep, timeout};
+use std::{io, path::Path, pin::pin, sync::Arc, time::Duration};
+use tokio::{select, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tun_rs::AsyncDevice;
 
-use crate::{
-    ESP32_NODE_ID, MAC_QUERY_RETRIES, MAC_QUERY_RETRY_DELAY_MS, MAC_QUERY_TIMEOUT_MS,
-    create_tap_interface, log_mac,
-};
+use crate::{bridge, create_tap_interface, log_mac};
 
 const MAX_ERGOT_PACKET_SIZE: u16 = 2048;
 const TX_BUFFER_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
 const DEVICE_POLL_INTERVAL_MS: u64 = 500;
 
-pub async fn run(port: Option<&str>, by_id: Option<&str>, baud: u32) -> io::Result<()> {
+pub async fn run(
+    port: Option<&str>,
+    by_id: Option<&str>,
+    baud: u32,
+    cancel: CancellationToken,
+) -> io::Result<()> {
     match (port, by_id) {
         (Some(port), None) => {
             // Direct port mode - no hot-plug
-            run_with_port(port, baud).await
+            run_with_port(port, baud, cancel).await
         }
         (None, Some(pattern)) => {
             // Hot-plug mode using /dev/serial/by-id/
-            run_with_hotplug(pattern, baud).await
+            run_with_hotplug(pattern, baud, cancel).await
         }
         (Some(port), Some(_)) => {
             // If both provided, prefer direct port
             warn!("Both --port and --by-id provided, using --port");
-            run_with_port(port, baud).await
+            run_with_port(port, baud, cancel).await
         }
         (None, None) => Err(io::Error::other(
             "Either --port or --by-id must be provided",
@@ -43,7 +41,7 @@ pub async fn run(port: Option<&str>, by_id: Option<&str>, baud: u32) -> io::Resu
 }
 
 /// Run with a fixed port path (no hot-plug)
-async fn run_with_port(port: &str, baud: u32) -> io::Result<()> {
+async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::Result<()> {
     let stack: RouterStack = RouterStack::new();
 
     info!(
@@ -62,18 +60,34 @@ async fn run_with_port(port: &str, baud: u32) -> io::Result<()> {
 
     sleep(Duration::from_secs(2)).await;
 
-    let expected_mac = query_mac_with_retry(&stack, interface_id).await?;
+    let expected_mac = bridge::query_mac_with_retry_serial(&stack, interface_id).await?;
     log_mac(&expected_mac);
 
     let tap_device = create_tap_interface(&expected_mac)?;
 
-    run_bridge(stack, tap_device).await
+    // Spawn bridge tasks
+    let ping_handle = tokio::spawn(ping_listener(stack.clone(), cancel.clone()));
+    let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
+        stack.clone(),
+        tap_device.clone(),
+        cancel.clone(),
+    ));
+    let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(stack, tap_device, cancel.clone()));
+
+    // Wait for cancellation
+    cancel.cancelled().await;
+
+    // Wait for bridge tasks to finish
+    let _ = tokio::join!(ping_handle, tap_to_wifi_handle, wifi_to_tap_handle);
+
+    info!("Serial transport shut down complete");
+    Ok(())
 }
 
 /// Run with hot-plug support using /dev/serial/by-id/ pattern matching
-async fn run_with_hotplug(pattern: &str, baud: u32) -> io::Result<()> {
+async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -> io::Result<()> {
     let mut expected_mac: Option<[u8; 6]> = None;
-    let mut tap_device: Option<std::sync::Arc<AsyncDevice>> = None;
+    let mut tap_device: Option<Arc<AsyncDevice>> = None;
 
     info!(
         "Hot-plug mode enabled, watching for devices matching: {}",
@@ -81,12 +95,19 @@ async fn run_with_hotplug(pattern: &str, baud: u32) -> io::Result<()> {
     );
 
     loop {
-        // Wait for device to appear
+        // Wait for device to appear (or cancellation)
         let port_path = loop {
-            if let Some(path) = find_device_by_id(pattern) {
-                break path;
+            select! {
+                _ = cancel.cancelled() => {
+                    info!("Shutdown requested");
+                    return Ok(());
+                }
+                _ = sleep(Duration::from_millis(DEVICE_POLL_INTERVAL_MS)) => {
+                    if let Some(path) = find_device_by_id(pattern) {
+                        break path;
+                    }
+                }
             }
-            sleep(Duration::from_millis(DEVICE_POLL_INTERVAL_MS)).await;
         };
 
         info!("Found device at {}", port_path);
@@ -108,7 +129,7 @@ async fn run_with_hotplug(pattern: &str, baud: u32) -> io::Result<()> {
 
                 sleep(Duration::from_secs(2)).await;
 
-                match query_mac_with_retry(&stack, interface_id).await {
+                match bridge::query_mac_with_retry_serial(&stack, interface_id).await {
                     Ok(mac) => {
                         if let Some(expected) = expected_mac {
                             if mac != expected {
@@ -139,9 +160,47 @@ async fn run_with_hotplug(pattern: &str, baud: u32) -> io::Result<()> {
 
                         if let Some(ref tap) = tap_device {
                             info!("Starting bridge...");
-                            // Run the bridge - this will return when the connection is lost
-                            if let Err(e) = run_bridge_until_disconnect(stack, tap.clone()).await {
-                                warn!("Bridge disconnected: {:?}", e);
+
+                            // Create a child cancellation token for this session
+                            let session_cancel = cancel.child_token();
+
+                            // Spawn bridge tasks
+                            let ping_handle =
+                                tokio::spawn(ping_listener(stack.clone(), session_cancel.clone()));
+                            let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
+                                stack.clone(),
+                                tap.clone(),
+                                session_cancel.clone(),
+                            ));
+                            let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(
+                                stack,
+                                tap.clone(),
+                                session_cancel.clone(),
+                            ));
+
+                            // Wait for either global cancellation or any task to complete
+                            select! {
+                                _ = cancel.cancelled() => {
+                                    info!("Shutdown requested");
+                                    session_cancel.cancel();
+                                }
+                                _ = ping_handle => {
+                                    info!("Ping listener ended, assuming disconnect");
+                                    session_cancel.cancel();
+                                }
+                                _ = tap_to_wifi_handle => {
+                                    info!("TAP to WiFi task ended, assuming disconnect");
+                                    session_cancel.cancel();
+                                }
+                                _ = wifi_to_tap_handle => {
+                                    info!("WiFi to TAP task ended, assuming disconnect");
+                                    session_cancel.cancel();
+                                }
+                            }
+
+                            // Check if we were cancelled globally
+                            if cancel.is_cancelled() {
+                                return Ok(());
                             }
                         }
                     }
@@ -186,198 +245,69 @@ fn find_device_by_id(pattern: &str) -> Option<String> {
     None
 }
 
-/// Run the bridge tasks (blocking, returns only on error)
-async fn run_bridge(stack: RouterStack, tap_device: std::sync::Arc<AsyncDevice>) -> io::Result<()> {
-    tokio::task::spawn(ping_listener(stack.clone()));
-    tokio::task::spawn(tap_to_wifi(stack.clone(), tap_device.clone()));
-    tokio::task::spawn(wifi_to_tap(stack.clone(), tap_device.clone()));
-
-    // Keep the main task alive
-    loop {
-        sleep(Duration::from_secs(60)).await;
-    }
-}
-
-/// Run the bridge tasks until disconnection is detected
-async fn run_bridge_until_disconnect(
-    stack: RouterStack,
-    tap_device: std::sync::Arc<AsyncDevice>,
-) -> io::Result<()> {
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
-
-    let stack_clone = stack.clone();
-    let tap_clone = tap_device.clone();
-
-    // Spawn bridge tasks
-    let ping_handle = tokio::task::spawn(ping_listener(stack.clone()));
-    let tap_to_wifi_handle =
-        tokio::task::spawn(tap_to_wifi_with_error(stack_clone, tap_clone.clone(), tx));
-    let wifi_to_tap_handle = tokio::task::spawn(wifi_to_tap(stack, tap_device));
-
-    // Wait for any task to signal disconnect or error
-    tokio::select! {
-        _ = &mut rx => {
-            info!("Connection lost signal received");
-        }
-        _ = ping_handle => {
-            info!("Ping listener ended");
-        }
-        _ = wifi_to_tap_handle => {
-            info!("WiFi to TAP task ended");
-        }
-    }
-
-    tap_to_wifi_handle.abort();
-
-    Ok(())
-}
-
-async fn query_mac_with_retry(stack: &RouterStack, interface_id: u64) -> io::Result<[u8; 6]> {
-    let mut last_err: Option<io::Error> = None;
-    for attempt in 1..=MAC_QUERY_RETRIES {
-        info!(
-            "Querying WiFi MAC from ESP32 (attempt {}/{})...",
-            attempt, MAC_QUERY_RETRIES
-        );
-        match timeout(
-            Duration::from_millis(MAC_QUERY_TIMEOUT_MS),
-            query_mac_for_interface(stack, interface_id),
-        )
-        .await
-        {
-            Ok(Ok(mac)) => return Ok(mac),
-            Ok(Err(err)) => {
-                last_err = Some(err);
-            }
-            Err(_) => {
-                last_err = Some(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Timed out waiting for ESP32 MAC response",
-                ));
-            }
-        }
-        sleep(Duration::from_millis(MAC_QUERY_RETRY_DELAY_MS)).await;
-    }
-
-    Err(last_err.unwrap_or_else(|| io::Error::other("Failed to query ESP32 MAC")))
-}
-
-async fn query_mac_for_interface(stack: &RouterStack, interface_id: u64) -> io::Result<[u8; 6]> {
-    let net_id = stack
-        .manage_profile(|im| im.interface_state(interface_id))
-        .and_then(|state| match state {
-            InterfaceState::Active { net_id, node_id: _ } => Some(net_id),
-            _ => None,
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No active interface"))?;
-
-    let addr = Address {
-        network_id: net_id,
-        node_id: ESP32_NODE_ID,
-        port_id: 0,
-    };
-
-    stack
-        .endpoints()
-        .request::<GetMacEndpoint>(addr, &(), Some("mac"))
-        .await
-        .map_err(|err| io::Error::other(format!("{:?}", err)))
-}
-
-async fn ping_listener(stack: RouterStack) {
+async fn ping_listener(stack: RouterStack, cancel: CancellationToken) {
     let subber = stack.topics().heap_bounded_receiver::<PingTopic>(64, None);
     let subber = pin!(subber);
     let mut hdl = subber.subscribe();
 
     loop {
-        let msg = hdl.recv().await;
-        trace!("Received ping broadcast: {:?}", msg);
+        select! {
+            msg = hdl.recv() => {
+                trace!("Received ping broadcast: {:?}", msg);
+            }
+            _ = cancel.cancelled() => {
+                info!("Ping listener shutting down");
+                break;
+            }
+        }
     }
 }
 
 /// Forward frames from TAP interface to ESP32-C3 via WiFi
-async fn tap_to_wifi(stack: RouterStack, tap_device: std::sync::Arc<AsyncDevice>) {
+async fn tap_to_wifi(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: CancellationToken) {
     info!("TAP to WiFi forwarder started");
 
     let mut buf = [0u8; MAX_FRAME_SIZE];
 
     loop {
-        let frame = match tap_device.recv(&mut buf).await {
-            Ok(n) => {
-                if n == 0 {
-                    continue;
+        select! {
+            result = tap_device.recv(&mut buf) => {
+                let frame = match result {
+                    Ok(n) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
+                        if frame_data.extend_from_slice(&buf[..n]).is_err() {
+                            continue;
+                        }
+                        WifiFrame { data: frame_data }
+                    }
+                    Err(e) => {
+                        error!("TAP read error: {:?}", e);
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+
+                if let Err(e) = stack
+                    .topics()
+                    .broadcast_wait::<WifiTxTopic>(&frame, None)
+                    .await
+                {
+                    warn!("WiFi broadcast failed: {:?}", e);
                 }
-                let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
-                if frame_data.extend_from_slice(&buf[..n]).is_err() {
-                    continue;
-                }
-                WifiFrame { data: frame_data }
             }
-            Err(e) => {
-                error!("TAP read error: {:?}", e);
-                sleep(Duration::from_millis(100)).await;
-                continue;
+            _ = cancel.cancelled() => {
+                info!("TAP to WiFi forwarder shutting down");
+                break;
             }
-        };
-
-        if let Err(e) = stack
-            .topics()
-            .broadcast_wait::<WifiTxTopic>(&frame, None)
-            .await
-        {
-            warn!("WiFi broadcast failed: {:?}", e);
-        }
-    }
-}
-
-/// Forward frames from TAP interface to ESP32-C3 via WiFi, with error signaling
-async fn tap_to_wifi_with_error(
-    stack: RouterStack,
-    tap_device: std::sync::Arc<AsyncDevice>,
-    _disconnect_signal: tokio::sync::oneshot::Sender<()>,
-) {
-    info!("TAP to WiFi forwarder started (with disconnect detection)");
-
-    let mut buf = [0u8; MAX_FRAME_SIZE];
-    let mut consecutive_errors = 0;
-
-    loop {
-        let frame = match tap_device.recv(&mut buf).await {
-            Ok(n) => {
-                consecutive_errors = 0;
-                if n == 0 {
-                    continue;
-                }
-                let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
-                if frame_data.extend_from_slice(&buf[..n]).is_err() {
-                    continue;
-                }
-                WifiFrame { data: frame_data }
-            }
-            Err(e) => {
-                error!("TAP read error: {:?}", e);
-                consecutive_errors += 1;
-                if consecutive_errors > 10 {
-                    warn!("Too many consecutive TAP errors, assuming disconnect");
-                    return;
-                }
-                sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-
-        if let Err(e) = stack
-            .topics()
-            .broadcast_wait::<WifiTxTopic>(&frame, None)
-            .await
-        {
-            warn!("WiFi broadcast failed: {:?}", e);
         }
     }
 }
 
 /// Forward frames from ESP32-C3 WiFi to TAP interface
-async fn wifi_to_tap(stack: RouterStack, tap_device: std::sync::Arc<AsyncDevice>) {
+async fn wifi_to_tap(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: CancellationToken) {
     info!("WiFi to TAP forwarder started");
 
     let subber = stack
@@ -387,11 +317,15 @@ async fn wifi_to_tap(stack: RouterStack, tap_device: std::sync::Arc<AsyncDevice>
     let mut hdl = subber.subscribe();
 
     loop {
-        let msg = hdl.recv().await;
-        match tap_device.send(&msg.t.data).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("TAP write error: {:?}", e);
+        select! {
+            msg = hdl.recv() => {
+                if let Err(e) = tap_device.send(&msg.t.data).await {
+                    error!("TAP write error: {:?}", e);
+                }
+            }
+            _ = cancel.cancelled() => {
+                info!("WiFi to TAP forwarder shutting down");
+                break;
             }
         }
     }

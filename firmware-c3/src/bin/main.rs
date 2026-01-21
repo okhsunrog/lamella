@@ -8,8 +8,8 @@
 use core::{future::poll_fn, pin::pin, task::Poll};
 
 use defmt::{info, warn};
-use embassy_executor::{task, Spawner};
-use embassy_futures::select::{select, Either};
+use embassy_executor::{Spawner, task};
+use embassy_futures::select::{Either, select};
 use embassy_net_driver::Driver as NetDriver;
 use embassy_time::{Duration, Timer};
 use embedded_io_async_0_7::Write;
@@ -25,9 +25,11 @@ use esp_hal::{
     timer::timg::TimerGroup,
     usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
 };
-use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState};
+use esp_radio::wifi::{
+    ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
+};
 use heapless::Vec as HVec;
-use icd::{GetMacEndpoint, WifiFrame, WifiRxTopic, WifiTxTopic, MAX_FRAME_SIZE};
+use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxTopic};
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
 use panic_rtt_target as _;
 use static_cell::{ConstStaticCell, StaticCell};
@@ -55,7 +57,8 @@ type Queue = kit::Queue<OUT_QUEUE_SIZE, CsCoord>;
 /// Statically store our outgoing packet buffer
 static OUTQ: Queue = kit::Queue::new();
 /// Statically store our netstack
-static STACK: Stack = kit::new_target_stack(OUTQ.stream_producer(), Some(&OUTQ), MAX_PACKET_SIZE as u16);
+static STACK: Stack =
+    kit::new_target_stack(OUTQ.stream_producer(), Some(&OUTQ), MAX_PACKET_SIZE as u16);
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -89,7 +92,9 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // Create USB Serial/JTAG interface
-    let (rx, tx) = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async().split();
+    let (rx, tx) = UsbSerialJtag::new(peripherals.USB_DEVICE)
+        .into_async()
+        .split();
 
     // Create RX worker
     static RECV_BUF: ConstStaticCell<[u8; MAX_PACKET_SIZE]> =
@@ -132,15 +137,13 @@ async fn run_tx(mut tx: UsbSerialJtagTx<'static, Async>) {
         let len = data.len();
         let write_fut = Write::write(&mut tx, &data);
         match select(write_fut, Timer::after_millis(SERIAL_TX_TIMEOUT_MS)).await {
-            Either::First(res) => {
-                match res {
-                    Ok(used) => data.release(used),
-                    Err(_) => {
-                        warn!("Serial TX error");
-                        data.release(len);
-                    }
+            Either::First(res) => match res {
+                Ok(used) => data.release(used),
+                Err(_) => {
+                    warn!("Serial TX error");
+                    data.release(len);
                 }
-            }
+            },
             Either::Second(()) => {
                 warn!("Serial TX timeout, dropping {} bytes", len);
                 data.release(len);

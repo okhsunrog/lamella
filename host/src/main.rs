@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use log::info;
 use std::{io, sync::Arc};
+use tokio_util::sync::CancellationToken;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 
+mod bridge;
 mod nusb_transport;
 mod serial_transport;
 
@@ -45,12 +47,31 @@ async fn main() -> io::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.transport {
-        Transport::Nusb => nusb_transport::run().await,
-        Transport::Serial { port, by_id, baud } => {
-            serial_transport::run(port.as_deref(), by_id.as_deref(), baud).await
+    // Set up Ctrl-C handler
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Received Ctrl-C, shutting down...");
+                cancel_clone.cancel();
+            }
+            Err(e) => {
+                eprintln!("Failed to listen for Ctrl-C: {}", e);
+            }
         }
-    }
+    });
+
+    let result = match cli.transport {
+        Transport::Nusb => nusb_transport::run(cancel).await,
+        Transport::Serial { port, by_id, baud } => {
+            serial_transport::run(port.as_deref(), by_id.as_deref(), baud, cancel).await
+        }
+    };
+
+    info!("Application exiting");
+    result
 }
 
 /// Create and configure the TAP interface with the given MAC address
