@@ -206,18 +206,13 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
     }
 }
 
-fn cobs_max_encoding_length(source_len: usize) -> usize {
-    source_len + source_len.div_ceil(254)
-}
-
-async fn wait_for_outq_space() {
-    let max_len = cobs_max_encoding_length(MAX_PACKET_SIZE);
-    let grant = OUTQ.stream_producer().wait_grant_exact(max_len).await;
-    drop(grant);
-}
-
-fn try_broadcast_wifi_frame(frame: &WifiFrame) -> bool {
-    STACK.topics().broadcast::<WifiRxTopic>(frame, None).is_ok()
+/// Send a frame from host to WiFi
+fn send_to_wifi(wifi_device: &mut WifiDevice<'static>, data: &[u8]) {
+    if let Some(tx_token) = wifi_device.transmit() {
+        tx_token.consume_token(data.len(), |buffer| {
+            buffer.copy_from_slice(data);
+        });
+    }
 }
 
 /// Bidirectional WiFi bridge - forwards frames between WiFi and ergot/USB
@@ -253,58 +248,19 @@ async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
     let subber = pin!(subber);
     let mut host_rx = subber.subscribe();
 
-    let mut pending_wifi_frame: Option<WifiFrame> = None;
-
     loop {
-        if let Some(frame) = pending_wifi_frame.take() {
-            if try_broadcast_wifi_frame(&frame) {
-                continue;
-            }
-
-            match select(wait_for_outq_space(), host_rx.recv()).await {
-                Either::First(()) => {
-                    pending_wifi_frame = Some(frame);
-                }
-                Either::Second(msg) => {
-                    if let Some(tx_token) = wifi_device.transmit() {
-                        tx_token.consume_token(msg.t.data.len(), |buffer| {
-                            buffer.copy_from_slice(&msg.t.data);
-                        });
-                    }
-                    pending_wifi_frame = Some(frame);
-                }
-            }
-            continue;
-        }
-
-        // Ensure there is room in the serial TX queue before pulling another WiFi frame.
-        match select(wait_for_outq_space(), host_rx.recv()).await {
-            Either::First(()) => {}
-            Either::Second(msg) => {
-                if let Some(tx_token) = wifi_device.transmit() {
-                    tx_token.consume_token(msg.t.data.len(), |buffer| {
-                        buffer.copy_from_slice(&msg.t.data);
-                    });
-                }
-                continue;
-            }
-        }
-
-        // Create futures for WiFi RX and host TX
+        // Wait for either a WiFi frame or a host frame
         let wifi_rx_fut = poll_fn(|cx| {
             if let Some((rx_token, _tx_token)) = NetDriver::receive(&mut wifi_device, cx) {
-                Poll::Ready(Some(rx_token))
+                Poll::Ready(rx_token)
             } else {
                 Poll::Pending
             }
         });
 
-        let host_tx_fut = host_rx.recv();
-
-        // Wait for either WiFi frame or host frame
-        match select(wifi_rx_fut, host_tx_fut).await {
-            Either::First(Some(rx_token)) => {
-                // WiFi -> Host: forward received frame to ergot
+        match select(wifi_rx_fut, host_rx.recv()).await {
+            Either::First(rx_token) => {
+                // WiFi -> Host: consume the frame and forward to ergot
                 let mut frame_opt = None;
                 rx_token.consume_token(|buffer| {
                     let mut frame_data = HVec::<u8, MAX_FRAME_SIZE>::new();
@@ -312,22 +268,31 @@ async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
                         frame_opt = Some(WifiFrame { data: frame_data });
                     }
                 });
+
                 if let Some(frame) = frame_opt {
-                    if !try_broadcast_wifi_frame(&frame) {
-                        pending_wifi_frame = Some(frame);
+                    // Use broadcast_wait with select to handle backpressure while
+                    // still processing host->wifi frames
+                    loop {
+                        let broadcast_fut =
+                            STACK.topics().broadcast_wait::<WifiRxTopic>(&frame, None);
+                        match select(broadcast_fut, host_rx.recv()).await {
+                            Either::First(result) => {
+                                if let Err(e) = result {
+                                    warn!("Failed to broadcast WiFi frame: {:?}", e);
+                                }
+                                break;
+                            }
+                            Either::Second(msg) => {
+                                // Handle host->wifi while waiting for broadcast
+                                send_to_wifi(&mut wifi_device, &msg.t.data);
+                            }
+                        }
                     }
                 }
             }
-            Either::First(None) => {
-                // No RX token, shouldn't happen after Ready
-            }
             Either::Second(msg) => {
                 // Host -> WiFi: forward frame to WiFi
-                if let Some(tx_token) = wifi_device.transmit() {
-                    tx_token.consume_token(msg.t.data.len(), |buffer| {
-                        buffer.copy_from_slice(&msg.t.data);
-                    });
-                }
+                send_to_wifi(&mut wifi_device, &msg.t.data);
             }
         }
     }
