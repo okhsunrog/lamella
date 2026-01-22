@@ -330,3 +330,114 @@ async fn wifi_to_tap(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: C
         }
     }
 }
+
+// ============================================================================
+// Test Mode
+// ============================================================================
+
+/// Run in test mode with smoltcp stack (no TAP interface)
+pub async fn run_test_mode(
+    port: Option<&str>,
+    by_id: Option<&str>,
+    baud: u32,
+    cancel: CancellationToken,
+    bandwidth_target: Option<String>,
+) -> io::Result<()> {
+    match (port, by_id) {
+        (Some(port), None) => run_test_mode_with_port(port, baud, cancel, bandwidth_target).await,
+        (None, Some(pattern)) => {
+            // For test mode, just wait for the device once
+            info!("Test mode: waiting for device matching: {}", pattern);
+            loop {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                if let Some(path) = find_device_by_id(pattern) {
+                    return run_test_mode_with_port(&path, baud, cancel, bandwidth_target).await;
+                }
+                sleep(Duration::from_millis(DEVICE_POLL_INTERVAL_MS)).await;
+            }
+        }
+        (Some(port), Some(_)) => {
+            warn!("Both --port and --by-id provided, using --port");
+            run_test_mode_with_port(port, baud, cancel, bandwidth_target).await
+        }
+        (None, None) => Err(io::Error::other(
+            "Either --port or --by-id must be provided",
+        )),
+    }
+}
+
+async fn run_test_mode_with_port(
+    port: &str,
+    baud: u32,
+    cancel: CancellationToken,
+    bandwidth_target: Option<String>,
+) -> io::Result<()> {
+    use crate::test_mode::{
+        RxQueue, bridge_ergot_to_smoltcp_serial, run_smoltcp_stack, run_udp_bandwidth_test,
+    };
+    use smoltcp::wire::Ipv4Address;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    let stack: RouterStack = RouterStack::new();
+
+    info!(
+        "[TEST MODE] Connecting to ESP32-C3 via serial port {} @ {} baud...",
+        port, baud
+    );
+
+    let interface_id =
+        register_router_interface(&stack, port, baud, MAX_ERGOT_PACKET_SIZE, TX_BUFFER_SIZE)
+            .await
+            .map_err(|e| io::Error::other(format!("Failed to register serial interface: {:?}", e)))?;
+
+    info!("Serial interface registered (id: {})", interface_id);
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mac = bridge::query_mac_with_retry_serial(&stack, interface_id).await?;
+    crate::log_mac(&mac);
+
+    // Create channels for smoltcp <-> ergot bridge
+    let rx_queue: RxQueue = Arc::new(Mutex::new(VecDeque::new()));
+    let (tx_sender, tx_receiver) = mpsc::unbounded_channel();
+
+    // Spawn the bridge task
+    let bridge_cancel = cancel.clone();
+    let bridge_stack = stack.clone();
+    let bridge_rx_queue = rx_queue.clone();
+    tokio::spawn(async move {
+        bridge_ergot_to_smoltcp_serial(bridge_stack, bridge_rx_queue, tx_receiver, bridge_cancel)
+            .await;
+    });
+
+    // Spawn ping listener for debugging
+    tokio::spawn(ping_listener(stack, cancel.clone()));
+
+    // Run appropriate test
+    if let Some(target) = bandwidth_target {
+        // Parse IP:PORT
+        let parts: Vec<&str> = target.split(':').collect();
+        if parts.len() != 2 {
+            return Err(io::Error::other(
+                "Invalid bandwidth target format. Use IP:PORT (e.g., 10.77.77.100:5000)",
+            ));
+        }
+        let ip_parts: Vec<u8> = parts[0]
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if ip_parts.len() != 4 {
+            return Err(io::Error::other("Invalid IP address"));
+        }
+        let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
+        let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
+        
+        run_udp_bandwidth_test(mac, rx_queue, tx_sender, server_ip, server_port, cancel).await
+    } else {
+        run_smoltcp_stack(mac, rx_queue, tx_sender, cancel).await
+    }
+}

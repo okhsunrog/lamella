@@ -5,7 +5,7 @@
     reason = "mem::forget is generally not safe to do with esp_hal types"
 )]
 
-use core::{future::poll_fn, pin::pin, task::Poll};
+use core::{future::poll_fn, pin::pin, sync::atomic::{AtomicBool, Ordering}, task::Poll};
 
 use embassy_executor::{Spawner, task};
 use embassy_futures::select::{Either, select};
@@ -23,9 +23,7 @@ use esp_hal::{
     otg_fs::{Usb, asynch::Driver as EspUsbDriver},
     timer::timg::TimerGroup,
 };
-use esp_radio::wifi::{
-    ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
-};
+use esp_radio::wifi::{ModeConfig, WifiController, WifiDevice, WifiEvent, sta::StationConfig};
 use heapless::Vec as HVec;
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxTopic};
 use log::info;
@@ -58,6 +56,8 @@ static STACK: Stack =
     kit::new_target_stack(OUTQ.framed_producer(), Some(&OUTQ), MAX_PACKET_SIZE as u16);
 /// Statically store our USB app buffers
 static STORAGE: kit::WireStorage<256, 256, 64, 256> = kit::WireStorage::new();
+/// WiFi connection state (set by wifi_connection task)
+static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 fn usb_config(serial: &'static str) -> embassy_usb::Config<'static> {
     let mut config = embassy_usb::Config::new(0x16c0, 0x27DD);
@@ -84,16 +84,15 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
+    let sw_interrupt =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
     info!("Embassy initialized!");
 
     // Initialize Wi-Fi/BLE radio
-    static RADIO_CTRL: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
-    let radio_ctrl = RADIO_CTRL.init(esp_radio::init().expect("Failed to initialize radio"));
-
     let (wifi_controller, interfaces) =
-        esp_radio::wifi::new(radio_ctrl, peripherals.WIFI, Default::default())
+        esp_radio::wifi::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi");
 
     // Generate a unique serial number from chip ID
@@ -137,7 +136,7 @@ async fn main(spawner: Spawner) -> ! {
     let rxvr: RxWorker = kit::RxWorker::new(&STACK, ep_out);
 
     // Get WiFi MAC address before moving the device
-    let wifi_mac = interfaces.sta.mac_address();
+    let wifi_mac = interfaces.station.mac_address();
     info!(
         "WiFi MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         wifi_mac[0], wifi_mac[1], wifi_mac[2], wifi_mac[3], wifi_mac[4], wifi_mac[5]
@@ -149,7 +148,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.must_spawn(pingserver());
     spawner.must_spawn(wifi_connection(wifi_controller));
     spawner.must_spawn(mac_server(wifi_mac));
-    spawner.must_spawn(wifi_bridge(interfaces.sta));
+    spawner.must_spawn(wifi_bridge(interfaces.station));
 
     // Keep main task alive
     loop {
@@ -206,20 +205,22 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
     info!("Connecting to SSID: {}", SSID);
 
     loop {
-        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
+        if controller.is_connected().unwrap_or(false) {
+            WIFI_CONNECTED.store(true, Ordering::Relaxed);
             info!("WiFi connected, waiting for disconnect event...");
-            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+            controller.wait_for_event(WifiEvent::StationDisconnected).await;
+            WIFI_CONNECTED.store(false, Ordering::Relaxed);
             info!("WiFi disconnected!");
             Timer::after(Duration::from_millis(5000)).await;
         }
 
         if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = ModeConfig::Client(
-                ClientConfig::default()
+            let station_config = ModeConfig::Station(
+                StationConfig::default()
                     .with_ssid(SSID.into())
                     .with_password(PASSWORD.into()),
             );
-            controller.set_config(&client_config).unwrap();
+            controller.set_config(&station_config).unwrap();
             info!("Starting WiFi...");
             controller.start_async().await.unwrap();
             info!("WiFi started!");
@@ -227,7 +228,10 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
 
         info!("Connecting to AP...");
         match controller.connect_async().await {
-            Ok(_) => info!("WiFi connected to {}!", SSID),
+            Ok(_) => {
+                WIFI_CONNECTED.store(true, Ordering::Relaxed);
+                info!("WiFi connected to {}!", SSID);
+            }
             Err(e) => {
                 info!("Failed to connect: {:?}", e);
                 Timer::after(Duration::from_millis(5000)).await;
@@ -252,7 +256,7 @@ async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
 
     // Wait for WiFi to connect
     loop {
-        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
+        if WIFI_CONNECTED.load(Ordering::Relaxed) {
             break;
         }
         Timer::after(Duration::from_millis(100)).await;

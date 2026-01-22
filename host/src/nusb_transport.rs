@@ -262,3 +262,98 @@ async fn wifi_to_tap(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: C
         }
     }
 }
+
+// ============================================================================
+// Test Mode
+// ============================================================================
+
+/// Run in test mode with smoltcp stack (no TAP interface)
+pub async fn run_test_mode(
+    cancel: CancellationToken,
+    bandwidth_target: Option<String>,
+) -> io::Result<()> {
+    use crate::test_mode::{
+        RxQueue, bridge_ergot_to_smoltcp_nusb, run_smoltcp_stack, run_tcp_bandwidth_test,
+    };
+    use smoltcp::wire::Ipv4Address;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    let stack: RouterStack = RouterStack::new();
+
+    // Wait for ESP32 to connect
+    info!("[TEST MODE] Waiting for ESP32-S3 device (USB bulk)...");
+    let mut seen = HashSet::new();
+    let (interface_id, mac) = loop {
+        select! {
+            _ = cancel.cancelled() => {
+                info!("Shutdown requested before device connected");
+                return Ok(());
+            }
+            registered = async {
+                let registered = reconcile_and_register_devices(&stack, &mut seen).await;
+                if let Some((iface, _info)) = registered.first() {
+                    sleep(Duration::from_secs(2)).await;
+                    match bridge::query_mac_with_retry_nusb(&stack, *iface).await {
+                        Ok(mac) => Some((*iface, mac)),
+                        Err(e) => {
+                            warn!("Failed to query MAC: {:?}", e);
+                            None
+                        }
+                    }
+                } else {
+                    sleep(Duration::from_millis(500)).await;
+                    None
+                }
+            } => {
+                if let Some(result) = registered {
+                    break result;
+                }
+            }
+        }
+    };
+
+    crate::log_mac(&mac);
+    info!("Interface ID: {}", interface_id);
+
+    // Create channels for smoltcp <-> ergot bridge
+    let rx_queue: RxQueue = Arc::new(Mutex::new(VecDeque::new()));
+    let (tx_sender, tx_receiver) = mpsc::unbounded_channel();
+
+    // Spawn the bridge task
+    let bridge_cancel = cancel.clone();
+    let bridge_stack = stack.clone();
+    let bridge_rx_queue = rx_queue.clone();
+    tokio::spawn(async move {
+        bridge_ergot_to_smoltcp_nusb(bridge_stack, bridge_rx_queue, tx_receiver, bridge_cancel)
+            .await;
+    });
+
+    // Spawn ping listener for debugging
+    tokio::spawn(ping_listener(stack, cancel.clone()));
+
+    // Run appropriate test
+    if let Some(target) = bandwidth_target {
+        // Parse IP:PORT
+        let parts: Vec<&str> = target.split(':').collect();
+        if parts.len() != 2 {
+            return Err(io::Error::other(
+                "Invalid bandwidth target format. Use IP:PORT (e.g., 10.77.77.100:5000)",
+            ));
+        }
+        let ip_parts: Vec<u8> = parts[0]
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if ip_parts.len() != 4 {
+            return Err(io::Error::other("Invalid IP address"));
+        }
+        let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
+        let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
+
+        run_tcp_bandwidth_test(mac, rx_queue, tx_sender, server_ip, server_port, cancel).await
+    } else {
+        run_smoltcp_stack(mac, rx_queue, tx_sender, cancel).await
+    }
+}

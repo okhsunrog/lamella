@@ -7,6 +7,7 @@ use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 mod bridge;
 mod nusb_transport;
 mod serial_transport;
+mod test_mode;
 
 const TAP_MTU: u16 = 1478; // 1492-byte WiFi MTU minus 14-byte Ethernet header
 const ESP32_NODE_ID: u8 = 2;
@@ -20,6 +21,14 @@ const MAC_QUERY_TIMEOUT_MS: u64 = 2000;
 struct Cli {
     #[command(subcommand)]
     transport: Transport,
+
+    /// Run in test mode: use smoltcp stack instead of TAP, get IP via DHCP, run connectivity tests
+    #[arg(long, global = true)]
+    test: bool,
+
+    /// Run TCP bandwidth test (requires --test). Format: IP:PORT (e.g., 10.77.77.100:5000)
+    #[arg(long, global = true)]
+    bandwidth: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -64,9 +73,26 @@ async fn main() -> io::Result<()> {
     });
 
     let result = match cli.transport {
-        Transport::Nusb => nusb_transport::run(cancel).await,
+        Transport::Nusb => {
+            if cli.test {
+                nusb_transport::run_test_mode(cancel, cli.bandwidth).await
+            } else {
+                nusb_transport::run(cancel).await
+            }
+        }
         Transport::Serial { port, by_id, baud } => {
-            serial_transport::run(port.as_deref(), by_id.as_deref(), baud, cancel).await
+            if cli.test {
+                serial_transport::run_test_mode(
+                    port.as_deref(),
+                    by_id.as_deref(),
+                    baud,
+                    cancel,
+                    cli.bandwidth,
+                )
+                .await
+            } else {
+                serial_transport::run(port.as_deref(), by_id.as_deref(), baud, cancel).await
+            }
         }
     };
 

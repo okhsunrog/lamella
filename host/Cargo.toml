@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ergot = { git = "https://github.com/okhsunrog/ergot", branch = "for_lamella", features = ["nusb-v0_1", "tokio-serial-v5"] }
+ergot = { features = ["nusb-v0_1", "tokio-serial-v5"], path = "../../ergot/crates/ergot", version = "0.12.0" }
 icd = { path = "../icd" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
 log = "0.4"
@@ -18,3 +18,4 @@ nusb = "0.1.14"
 clap = { version = "4.5.54", features = ["derive"] }
 tokio-serial = "5.4.5"
 tokio-util = { version = "0.7.18", features = ["rt"] }
+smoltcp = { version = "0.12.0", features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-icmp", "socket-tcp", "socket-dhcpv4", "std", "socket-udp"], default-features = false }
