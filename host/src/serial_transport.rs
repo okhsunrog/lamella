@@ -342,9 +342,10 @@ pub async fn run_test_mode(
     baud: u32,
     cancel: CancellationToken,
     bandwidth_target: Option<String>,
+    http_target: Option<String>,
 ) -> io::Result<()> {
     match (port, by_id) {
-        (Some(port), None) => run_test_mode_with_port(port, baud, cancel, bandwidth_target).await,
+        (Some(port), None) => run_test_mode_with_port(port, baud, cancel, bandwidth_target, http_target).await,
         (None, Some(pattern)) => {
             // For test mode, just wait for the device once
             info!("Test mode: waiting for device matching: {}", pattern);
@@ -353,14 +354,14 @@ pub async fn run_test_mode(
                     return Ok(());
                 }
                 if let Some(path) = find_device_by_id(pattern) {
-                    return run_test_mode_with_port(&path, baud, cancel, bandwidth_target).await;
+                    return run_test_mode_with_port(&path, baud, cancel, bandwidth_target, http_target).await;
                 }
                 sleep(Duration::from_millis(DEVICE_POLL_INTERVAL_MS)).await;
             }
         }
         (Some(port), Some(_)) => {
             warn!("Both --port and --by-id provided, using --port");
-            run_test_mode_with_port(port, baud, cancel, bandwidth_target).await
+            run_test_mode_with_port(port, baud, cancel, bandwidth_target, http_target).await
         }
         (None, None) => Err(io::Error::other(
             "Either --port or --by-id must be provided",
@@ -373,9 +374,10 @@ async fn run_test_mode_with_port(
     baud: u32,
     cancel: CancellationToken,
     bandwidth_target: Option<String>,
+    http_target: Option<String>,
 ) -> io::Result<()> {
     use crate::test_mode::{
-        RxQueue, bridge_ergot_to_smoltcp_serial, run_smoltcp_stack, run_udp_bandwidth_test,
+        RxQueue, bridge_ergot_to_smoltcp_serial, run_smoltcp_stack, run_udp_bandwidth_test, run_http_download_test,
     };
     use smoltcp::wire::Ipv4Address;
     use std::collections::VecDeque;
@@ -418,7 +420,34 @@ async fn run_test_mode_with_port(
     tokio::spawn(ping_listener(stack, cancel.clone()));
 
     // Run appropriate test
-    if let Some(target) = bandwidth_target {
+    if let Some(target) = http_target {
+        // Parse IP:PORT/path
+        let (addr, path) = if let Some(slash_pos) = target.find('/') {
+            let addr = &target[..slash_pos];
+            let path = &target[slash_pos..];
+            (addr, path.to_string())
+        } else {
+            return Err(io::Error::other(
+                "Invalid HTTP target format. Use IP:PORT/path (e.g., 10.77.77.100:8080/file.bin)",
+            ));
+        };
+
+        let parts: Vec<&str> = addr.split(':').collect();
+        if parts.len() != 2 {
+            return Err(io::Error::other("Invalid IP:PORT format"));
+        }
+        let ip_parts: Vec<u8> = parts[0]
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if ip_parts.len() != 4 {
+            return Err(io::Error::other("Invalid IP address"));
+        }
+        let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
+        let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
+
+        run_http_download_test(mac, rx_queue, tx_sender, server_ip, server_port, &path, cancel).await
+    } else if let Some(target) = bandwidth_target {
         // Parse IP:PORT
         let parts: Vec<&str> = target.split(':').collect();
         if parts.len() != 2 {
@@ -435,7 +464,7 @@ async fn run_test_mode_with_port(
         }
         let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
         let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
-        
+
         run_udp_bandwidth_test(mac, rx_queue, tx_sender, server_ip, server_port, cancel).await
     } else {
         run_smoltcp_stack(mac, rx_queue, tx_sender, cancel).await

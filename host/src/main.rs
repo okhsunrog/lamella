@@ -11,7 +11,7 @@ mod test_mode;
 
 const TAP_MTU: u16 = 1478; // 1492-byte WiFi MTU minus 14-byte Ethernet header
 const ESP32_NODE_ID: u8 = 2;
-const MAC_QUERY_RETRIES: usize = 10;
+const MAC_QUERY_RETRIES: usize = 3;
 const MAC_QUERY_RETRY_DELAY_MS: u64 = 300;
 const MAC_QUERY_TIMEOUT_MS: u64 = 2000;
 
@@ -29,6 +29,10 @@ struct Cli {
     /// Run TCP bandwidth test (requires --test). Format: IP:PORT (e.g., 10.77.77.100:5000)
     #[arg(long, global = true)]
     bandwidth: Option<String>,
+
+    /// Run HTTP download test (requires --test). Format: IP:PORT/path (e.g., 10.77.77.100:8080/file.bin)
+    #[arg(long, global = true)]
+    http: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -75,7 +79,7 @@ async fn main() -> io::Result<()> {
     let result = match cli.transport {
         Transport::Nusb => {
             if cli.test {
-                nusb_transport::run_test_mode(cancel, cli.bandwidth).await
+                nusb_transport::run_test_mode(cancel, cli.bandwidth, cli.http).await
             } else {
                 nusb_transport::run(cancel).await
             }
@@ -88,6 +92,7 @@ async fn main() -> io::Result<()> {
                     baud,
                     cancel,
                     cli.bandwidth,
+                    cli.http,
                 )
                 .await
             } else {

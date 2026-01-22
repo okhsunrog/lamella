@@ -271,6 +271,7 @@ async fn wifi_to_tap(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: C
 pub async fn run_test_mode(
     cancel: CancellationToken,
     bandwidth_target: Option<String>,
+    _http_target: Option<String>,
 ) -> io::Result<()> {
     use crate::test_mode::{
         RxQueue, bridge_ergot_to_smoltcp_nusb, run_smoltcp_stack, run_tcp_bandwidth_test,
