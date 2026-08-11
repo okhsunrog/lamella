@@ -119,7 +119,10 @@ async fn run_tx(mut tx: UsbSerialJtagTx<'static, Async>) {
         let len = data.len();
         let result = async {
             Write::write_all(&mut tx, &data).await?;
-            Write::flush(&mut tx).await
+            if len.is_multiple_of(64) {
+                Write::flush(&mut tx).await?;
+            }
+            Ok::<(), core::convert::Infallible>(())
         }
         .await;
 
