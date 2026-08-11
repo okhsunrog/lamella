@@ -19,7 +19,7 @@ name = "hello_test"
 test = false
 
 [dependencies]
-esp-hal = { git = "https://github.com/okhsunrog/esp-hal", features = ["defmt", "esp32c3", "unstable"], rev = "3a9d8b1ecbcc470e2ce55e494b587f29e985edff" }
+esp-hal = { git = "https://github.com/okhsunrog/esp-hal", features = ["defmt", "esp32c3", "unstable"], rev = "282f8582b8996c9c126c55ed0cc71126c1db74fa" }
 
 esp-rtos = { git = "https://github.com/okhsunrog/esp-hal", features = [
     "defmt",
@@ -27,12 +27,12 @@ esp-rtos = { git = "https://github.com/okhsunrog/esp-hal", features = [
     "esp-alloc",
     "esp-radio",
     "esp32c3",
-], rev = "3a9d8b1ecbcc470e2ce55e494b587f29e985edff" }
+], rev = "282f8582b8996c9c126c55ed0cc71126c1db74fa" }
 
 defmt = "1.1.1"
-esp-bootloader-esp-idf = { git = "https://github.com/okhsunrog/esp-hal", features = ["defmt", "esp32c3"], rev = "3a9d8b1ecbcc470e2ce55e494b587f29e985edff" }
+esp-bootloader-esp-idf = { git = "https://github.com/okhsunrog/esp-hal", features = ["defmt", "esp32c3"], rev = "282f8582b8996c9c126c55ed0cc71126c1db74fa" }
 
-esp-alloc = { git = "https://github.com/okhsunrog/esp-hal", features = ["defmt"], rev = "3a9d8b1ecbcc470e2ce55e494b587f29e985edff" }
+esp-alloc = { git = "https://github.com/okhsunrog/esp-hal", features = ["defmt"], rev = "282f8582b8996c9c126c55ed0cc71126c1db74fa" }
 panic-rtt-target = { version = "0.2.0", features = ["defmt"] }
 rtt-target = { version = "0.6.2", features = ["defmt"] }
 
@@ -49,7 +49,7 @@ esp-radio = { git = "https://github.com/okhsunrog/esp-hal", features = [
     "esp32c3",
     "unstable",
     "wifi",
-], rev = "3a9d8b1ecbcc470e2ce55e494b587f29e985edff" }
+], rev = "282f8582b8996c9c126c55ed0cc71126c1db74fa" }
 
 # Ergot and related
 ergot = { git = "https://github.com/jamesmunns/ergot", rev = "5a5fab8234339ecdc252e18c41ef2676bd6bb091", features = [
