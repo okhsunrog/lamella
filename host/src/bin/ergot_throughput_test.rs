@@ -1,7 +1,7 @@
 //! Ergot bidirectional throughput test
 //!
 //! Usage:
-//!   ergot_throughput_test <port> [mode] [duration-seconds]
+//!   ergot_throughput_test <port> [mode] [duration-seconds] [request-timeout-ms]
 //!   mode: rx (receive only), tx (send only), bidir (both, default)
 
 use ergot::Address;
@@ -21,6 +21,7 @@ const ESP32_NODE_ID: u8 = 2;
 const TEST_FRAME_SIZE: usize = 1400;
 const HOST_FRAME_BYTE: u8 = 0xCD;
 const DEVICE_FRAME_BYTE: u8 = 0xAB;
+const SLOW_RESPONSE_MICROS: u64 = 250_000;
 
 #[derive(Default)]
 struct Stats {
@@ -31,17 +32,45 @@ struct Stats {
     rx_endpoint_errors: AtomicU64,
     rx_response_mismatches: AtomicU64,
     rx_integrity_errors: AtomicU64,
+    rx_slow_responses: AtomicU64,
+    rx_max_latency_micros: AtomicU64,
     tx_bytes: AtomicU64,
     tx_frames: AtomicU64,
     tx_retries: AtomicU64,
     tx_timeouts: AtomicU64,
     tx_endpoint_errors: AtomicU64,
     tx_response_mismatches: AtomicU64,
+    tx_slow_responses: AtomicU64,
+    tx_max_latency_micros: AtomicU64,
 }
 
 impl Stats {
     fn failure_count(&self) -> u64 {
         self.rx_retries.load(Ordering::Relaxed) + self.tx_retries.load(Ordering::Relaxed)
+    }
+
+    fn record_rx_latency(&self, started: Instant) {
+        record_latency(
+            &self.rx_max_latency_micros,
+            &self.rx_slow_responses,
+            started,
+        );
+    }
+
+    fn record_tx_latency(&self, started: Instant) {
+        record_latency(
+            &self.tx_max_latency_micros,
+            &self.tx_slow_responses,
+            started,
+        );
+    }
+}
+
+fn record_latency(maximum: &AtomicU64, slow_responses: &AtomicU64, started: Instant) {
+    let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    maximum.fetch_max(micros, Ordering::Relaxed);
+    if micros >= SLOW_RESPONSE_MICROS {
+        slow_responses.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -58,9 +87,12 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <serial-port> [mode] [duration-seconds]", args[0]);
+        eprintln!(
+            "Usage: {} <serial-port> [mode] [duration-seconds] [request-timeout-ms]",
+            args[0]
+        );
         eprintln!("  mode: rx (receive only), tx (send only), bidir (both, default)");
-        eprintln!("Example: {} /dev/ttyACM0 bidir 300", args[0]);
+        eprintln!("Example: {} /dev/ttyACM0 bidir 300 2000", args[0]);
         std::process::exit(1);
     }
 
@@ -86,6 +118,20 @@ async fn main() {
                 std::process::exit(1);
             })
     });
+    let request_timeout = args
+        .get(4)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|millis| *millis > 0)
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| {
+                    eprintln!("Invalid request timeout: {value}. Use positive milliseconds");
+                    std::process::exit(1);
+                })
+        })
+        .unwrap_or(Duration::from_millis(250));
 
     println!(
         "Opening {}... (mode: {:?})",
@@ -96,6 +142,7 @@ async fn main() {
             Mode::Bidir => "bidir",
         }
     );
+    println!("Request timeout: {} ms", request_timeout.as_millis());
 
     let stack: RouterStack = RouterStack::new();
 
@@ -153,15 +200,19 @@ async fn main() {
                         frame: frame.clone(),
                     };
                     loop {
+                        let attempt_started = Instant::now();
                         match tokio::time::timeout(
-                            Duration::from_millis(250),
+                            request_timeout,
                             stack_clone
                                 .endpoints()
                                 .request::<WifiTxEndpoint>(peer, &request, None),
                         )
                         .await
                         {
-                            Ok(Ok(response)) if response.transaction == transaction => break,
+                            Ok(Ok(response)) if response.transaction == transaction => {
+                                stats.record_tx_latency(attempt_started);
+                                break;
+                            }
                             Ok(Ok(_)) => {
                                 stats.tx_retries.fetch_add(1, Ordering::Relaxed);
                                 stats.tx_response_mismatches.fetch_add(1, Ordering::Relaxed);
@@ -193,8 +244,9 @@ async fn main() {
                     next_transaction_id = next_transaction_id.wrapping_add(1);
                     let request = WifiRxRequest { transaction };
                     let response = loop {
+                        let attempt_started = Instant::now();
                         match tokio::time::timeout(
-                            Duration::from_millis(250),
+                            request_timeout,
                             stack_clone
                                 .endpoints()
                                 .request::<WifiRxEndpoint>(peer, &request, None),
@@ -207,6 +259,7 @@ async fn main() {
                                         && frame.data.iter().all(|byte| *byte == DEVICE_FRAME_BYTE)
                                 });
                                 if valid {
+                                    stats.record_rx_latency(attempt_started);
                                     break response;
                                 }
                                 stats.rx_retries.fetch_add(1, Ordering::Relaxed);
@@ -300,6 +353,13 @@ async fn main() {
             stats.tx_timeouts.load(Ordering::Relaxed),
             stats.tx_endpoint_errors.load(Ordering::Relaxed),
             stats.tx_response_mismatches.load(Ordering::Relaxed),
+        );
+        println!(
+            "  Latency: RX max={:.3}ms slow(>=250ms)={} | TX max={:.3}ms slow(>=250ms)={}",
+            stats.rx_max_latency_micros.load(Ordering::Relaxed) as f64 / 1000.0,
+            stats.rx_slow_responses.load(Ordering::Relaxed),
+            stats.tx_max_latency_micros.load(Ordering::Relaxed) as f64 / 1000.0,
+            stats.tx_slow_responses.load(Ordering::Relaxed),
         );
 
         last_rx_bytes = curr_rx_bytes;
