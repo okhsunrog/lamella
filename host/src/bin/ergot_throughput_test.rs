@@ -7,8 +7,10 @@
 use ergot::Address;
 use ergot::interface_manager::{InterfaceState, Profile};
 use ergot::toolkits::tokio_serial_v5::{self as kit, RouterStack};
-use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxEndpoint};
-use std::pin::pin;
+use icd::{
+    GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxEndpoint, WifiRxRequest, WifiTransaction,
+    WifiTxEndpoint, WifiTxRequest,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -91,30 +93,12 @@ async fn main() {
     let tx_bytes = Arc::new(AtomicU64::new(0));
     let tx_frames = Arc::new(AtomicU64::new(0));
 
-    // Spawn receiver task
-    if mode == Mode::RxOnly || mode == Mode::Bidir {
+    // One task owns the endpoint request path. Concurrent requests on the same
+    // Ergot stream can block one another before either response is delivered.
+    {
         let stack_clone = stack.clone();
         let rx_bytes_clone = rx_bytes.clone();
         let rx_frames_clone = rx_frames.clone();
-        tokio::spawn(async move {
-            let subber = stack_clone
-                .topics()
-                .heap_bounded_receiver::<WifiRxTopic>(64, None);
-            let subber = pin!(subber);
-            let mut hdl = subber.subscribe();
-
-            loop {
-                let msg = hdl.recv().await;
-                rx_frames_clone.fetch_add(1, Ordering::Relaxed);
-                rx_bytes_clone.fetch_add(msg.t.data.len() as u64, Ordering::Relaxed);
-            }
-        });
-        println!("Receiver started");
-    }
-
-    // Spawn sender task
-    if mode == Mode::TxOnly || mode == Mode::Bidir {
-        let stack_clone = stack.clone();
         let tx_bytes_clone = tx_bytes.clone();
         let tx_frames_clone = tx_frames.clone();
         tokio::spawn(async move {
@@ -124,29 +108,75 @@ async fn main() {
             let frame = WifiFrame { data: frame_data };
 
             let mut frame_count = 0u32;
+            let session = serial_session_id();
+            let mut next_transaction_id = 0u32;
             loop {
-                match stack_clone
-                    .endpoints()
-                    .request::<WifiTxEndpoint>(peer, &frame, None)
-                    .await
-                {
-                    Ok(_) => {
+                let has_tx = mode == Mode::TxOnly || mode == Mode::Bidir;
+                if has_tx {
+                    let transaction = WifiTransaction {
+                        session,
+                        id: next_transaction_id,
+                    };
+                    next_transaction_id = next_transaction_id.wrapping_add(1);
+                    let request = WifiTxRequest {
+                        transaction,
+                        frame: frame.clone(),
+                    };
+                    loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(250),
+                            stack_clone
+                                .endpoints()
+                                .request::<WifiTxEndpoint>(peer, &request, None),
+                        )
+                        .await
+                        {
+                            Ok(Ok(response)) if response.transaction == transaction => break,
+                            _ => continue,
+                        }
+                    }
+                    {
                         tx_frames_clone.fetch_add(1, Ordering::Relaxed);
                         tx_bytes_clone.fetch_add(1400, Ordering::Relaxed);
                         frame_count = frame_count.wrapping_add(1);
                     }
-                    Err(_) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                if mode == Mode::RxOnly || mode == Mode::Bidir {
+                    let transaction = WifiTransaction {
+                        session,
+                        id: next_transaction_id,
+                    };
+                    next_transaction_id = next_transaction_id.wrapping_add(1);
+                    let request = WifiRxRequest { transaction };
+                    let response = loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(250),
+                            stack_clone
+                                .endpoints()
+                                .request::<WifiRxEndpoint>(peer, &request, None),
+                        )
+                        .await
+                        {
+                            Ok(Ok(response)) if response.transaction == transaction => {
+                                break response;
+                            }
+                            _ => continue,
+                        }
+                    };
+                    if let Some(frame) = response.frame {
+                        rx_frames_clone.fetch_add(1, Ordering::Relaxed);
+                        rx_bytes_clone.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                     }
                 }
 
                 // Pace TX to allow ESP32 USB RX to process - critical for bidirectional
-                if frame_count % 5 == 0 {
+                if has_tx && frame_count.is_multiple_of(5) {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
         });
-        println!("Sender started");
+        println!("Exchange worker started");
     }
 
     // Stats reporter
@@ -200,6 +230,16 @@ async fn main() {
         last_tx_bytes = curr_tx_bytes;
         last_report = Instant::now();
     }
+}
+
+fn serial_session_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    now ^ u64::from(std::process::id()).rotate_left(32)
 }
 
 async fn query_mac(stack: &RouterStack, interface_id: u8) -> Result<[u8; 6], String> {

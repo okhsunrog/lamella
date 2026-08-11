@@ -16,14 +16,45 @@ pub struct WifiFrame {
     pub data: Vec<u8, MAX_FRAME_SIZE>,
 }
 
+#[derive(Serialize, Deserialize, Schema, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiTransaction {
+    pub session: u64,
+    pub id: u32,
+}
+
+#[derive(Serialize, Deserialize, Schema, Clone, Debug)]
+pub struct WifiTxRequest {
+    pub transaction: WifiTransaction,
+    pub frame: WifiFrame,
+}
+
+#[derive(Serialize, Deserialize, Schema, Clone, Copy, Debug)]
+pub struct WifiTxResponse {
+    pub transaction: WifiTransaction,
+}
+
+#[derive(Serialize, Deserialize, Schema, Clone, Copy, Debug)]
+pub struct WifiRxRequest {
+    pub transaction: WifiTransaction,
+}
+
+#[derive(Serialize, Deserialize, Schema, Clone, Debug)]
+pub struct WifiRxResponse {
+    pub transaction: WifiTransaction,
+    pub frame: Option<WifiFrame>,
+}
+
 // Reliably hand one Ethernet frame to the ESP32 WiFi driver. The response is
 // sent only after the driver has accepted the frame for transmission.
-endpoint!(WifiTxEndpoint, WifiFrame, (), "wifi/tx");
+endpoint!(WifiTxEndpoint, WifiTxRequest, WifiTxResponse, "wifi/tx");
 
-// Topic for frames coming from WiFi (ESP32-S3 publishes, host subscribes)
+// Short-poll one frame received by the ESP32-C3 WiFi driver. The host
+// serializes this with WifiTxEndpoint requests so only one request is ever in
+// flight on the USB stream.
+endpoint!(WifiRxEndpoint, WifiRxRequest, WifiRxResponse, "wifi/rx");
+
+// Legacy best-effort paths used by the ESP32-S3 firmware.
 topic!(WifiRxTopic, WifiFrame, "wifi/rx");
-
-// Legacy best-effort path used by the ESP32-S3 firmware.
 topic!(WifiTxTopic, WifiFrame, "wifi/tx");
 
 // Ping topic for testing

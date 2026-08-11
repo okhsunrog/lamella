@@ -5,7 +5,10 @@
 //! directly and perform DHCP + connectivity tests.
 
 use ergot::Address;
-use icd::{MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxEndpoint, WifiTxTopic};
+use icd::{
+    MAX_FRAME_SIZE, WifiFrame, WifiRxEndpoint, WifiRxRequest, WifiRxTopic, WifiTransaction,
+    WifiTxEndpoint, WifiTxRequest, WifiTxTopic,
+};
 use log::{debug, info, warn};
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
@@ -865,10 +868,9 @@ pub async fn bridge_ergot_to_smoltcp_serial(
 ) {
     info!("Starting ergot <-> smoltcp bridge (serial)");
 
-    // Run RX and TX in separate tasks to avoid blocking each other
-    let rx_cancel = cancel.clone();
-    let tx_cancel = cancel.clone();
-    let stack_clone = stack.clone();
+    // A single task owns the serial endpoint request path and performs TX and
+    // short RX polls sequentially.
+    let exchange_cancel = cancel.clone();
 
     // Shared stats
     let rx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -879,71 +881,104 @@ pub async fn bridge_ergot_to_smoltcp_serial(
     let tx_count_clone = tx_count.clone();
     let tx_blocked_clone = tx_blocked_ms.clone();
 
-    // RX task: WiFi -> smoltcp
-    let rx_task = tokio::spawn(async move {
-        let subber = stack
-            .topics()
-            .heap_bounded_receiver::<WifiRxTopic>(64, None);
-        let subber = pin!(subber);
-        let mut wifi_rx = subber.subscribe();
+    let exchange_task = tokio::spawn(async move {
+        let session = serial_session_id();
+        let mut next_transaction_id = 0u32;
 
         loop {
-            select! {
-                msg = wifi_rx.recv() => {
-                    let frame = msg.t.data.to_vec();
-                    let count = rx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    log_frame("RX", count, &frame);
+            let tx = tx_receiver.try_recv().ok().and_then(|frame| {
+                let count = tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                log_frame("TX", count, &frame);
 
-                    let queue_len = {
-                        let mut q = rx_queue.lock().unwrap();
-                        q.push_back(frame);
-                        q.len()
-                    };
+                let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
+                frame_data
+                    .extend_from_slice(&frame)
+                    .ok()
+                    .map(|()| (count, WifiFrame { data: frame_data }))
+            });
 
-                    if queue_len > 10 {
-                        warn!("RX queue backing up: {} frames", queue_len);
+            if let Some((count, frame)) = tx {
+                let start = std::time::Instant::now();
+                let transaction = WifiTransaction {
+                    session,
+                    id: next_transaction_id,
+                };
+                next_transaction_id = next_transaction_id.wrapping_add(1);
+                let request = WifiTxRequest { transaction, frame };
+
+                loop {
+                    let response = stack
+                        .endpoints()
+                        .request::<WifiTxEndpoint>(peer, &request, None);
+                    select! {
+                        result = response => match result {
+                            Ok(response) if response.transaction == transaction => break,
+                            Ok(response) => warn!(
+                                "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
+                                transaction, response.transaction
+                            ),
+                            Err(e) => warn!("WiFi TX request failed: {:?}", e),
+                        },
+                        _ = sleep(Duration::from_millis(250)) => {
+                            warn!("WiFi TX response timed out; retrying transaction {:?}", transaction);
+                        }
+                        _ = exchange_cancel.cancelled() => {
+                            info!("Exchange task cancelled");
+                            return;
+                        }
                     }
                 }
-                _ = rx_cancel.cancelled() => {
-                    info!("RX task cancelled");
-                    break;
+
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if elapsed_ms > 10 {
+                    warn!("WiFi TX request took {}ms for frame #{}", elapsed_ms, count);
+                    tx_blocked_clone.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-        }
-    });
 
-    // TX task: smoltcp -> WiFi
-    let tx_task = tokio::spawn(async move {
-        loop {
-            select! {
-                Some(frame) = tx_receiver.recv() => {
-                    let count = tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    log_frame("TX", count, &frame);
+            let transaction = WifiTransaction {
+                session,
+                id: next_transaction_id,
+            };
+            next_transaction_id = next_transaction_id.wrapping_add(1);
+            let request = WifiRxRequest { transaction };
 
-                    let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
-                    if frame_data.extend_from_slice(&frame).is_ok() {
-                        let wifi_frame = WifiFrame { data: frame_data };
-
-                        let start = std::time::Instant::now();
-                        let result = stack_clone
-                            .endpoints()
-                            .request::<WifiTxEndpoint>(peer, &wifi_frame, None)
-                            .await;
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-                        if elapsed_ms > 10 {
-                            warn!("WiFi TX request took {}ms for frame #{}", elapsed_ms, count);
-                            tx_blocked_clone.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
-                        }
-
-                        if let Err(e) = result {
-                            warn!("Failed to send to WiFi: {:?}", e);
-                        }
+            let response = loop {
+                let response = stack
+                    .endpoints()
+                    .request::<WifiRxEndpoint>(peer, &request, None);
+                select! {
+                    result = response => match result {
+                        Ok(response) if response.transaction == transaction => break response,
+                        Ok(response) => warn!(
+                            "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
+                            transaction, response.transaction
+                        ),
+                        Err(e) => warn!("WiFi RX request failed: {:?}", e),
+                    },
+                    _ = sleep(Duration::from_millis(250)) => {
+                        warn!("WiFi RX response timed out; retrying transaction {:?}", transaction);
+                    }
+                    _ = exchange_cancel.cancelled() => {
+                        info!("Exchange task cancelled");
+                        return;
                     }
                 }
-                _ = tx_cancel.cancelled() => {
-                    info!("TX task cancelled");
-                    break;
+            };
+
+            if let Some(message) = response.frame {
+                let frame = message.data.to_vec();
+                let count = rx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                log_frame("RX", count, &frame);
+
+                let queue_len = {
+                    let mut q = rx_queue.lock().unwrap();
+                    q.push_back(frame);
+                    q.len()
+                };
+
+                if queue_len > 10 {
+                    warn!("RX queue backing up: {} frames", queue_len);
                 }
             }
         }
@@ -972,9 +1007,19 @@ pub async fn bridge_ergot_to_smoltcp_serial(
     cancel.cancelled().await;
 
     // Wait for tasks to finish
-    let _ = tokio::join!(rx_task, tx_task, stats_task);
+    let _ = tokio::join!(exchange_task, stats_task);
 
     info!("Bridge shutdown complete");
+}
+
+fn serial_session_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    now ^ u64::from(std::process::id()).rotate_left(32)
 }
 
 fn log_frame(direction: &str, count: u64, frame: &[u8]) {

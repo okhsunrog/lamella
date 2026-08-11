@@ -4,10 +4,13 @@ use ergot::{
     Address,
     toolkits::tokio_serial_v5::{RouterStack, register_router_interface},
 };
-use icd::{MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxEndpoint};
+use icd::{
+    MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxEndpoint, WifiRxRequest, WifiTransaction,
+    WifiTxEndpoint, WifiTxRequest,
+};
 use log::{error, info, trace, warn};
 use std::{io, path::Path, pin::pin, sync::Arc, time::Duration};
-use tokio::{select, time::sleep};
+use tokio::{select, sync::mpsc, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tun_rs::AsyncDevice;
 
@@ -16,6 +19,7 @@ use crate::{bridge, create_tap_interface, log_mac};
 const MAX_ERGOT_PACKET_SIZE: u16 = 2048;
 const TX_BUFFER_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
 const DEVICE_POLL_INTERVAL_MS: u64 = 500;
+const REQUEST_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub async fn run(
     port: Option<&str>,
@@ -69,21 +73,24 @@ async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::
 
     let tap_device = create_tap_interface(&expected_mac)?;
 
-    // Spawn bridge tasks
+    // A reader queues TAP frames while one exchange task exclusively owns the
+    // Ergot request path.
+    let (tap_tx, tap_rx) = mpsc::channel(1);
     let ping_handle = tokio::spawn(ping_listener(stack.clone(), cancel.clone()));
-    let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
-        stack.clone(),
-        tap_device.clone(),
+    let tap_reader_handle = tokio::spawn(tap_reader(tap_device.clone(), tap_tx, cancel.clone()));
+    let exchange_handle = tokio::spawn(wifi_exchange(
+        stack,
+        tap_device,
         peer,
+        tap_rx,
         cancel.clone(),
     ));
-    let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(stack, tap_device, cancel.clone()));
 
     // Wait for cancellation
     cancel.cancelled().await;
 
     // Wait for bridge tasks to finish
-    let _ = tokio::join!(ping_handle, tap_to_wifi_handle, wifi_to_tap_handle);
+    let _ = tokio::join!(ping_handle, tap_reader_handle, exchange_handle);
 
     info!("Serial transport shut down complete");
     Ok(())
@@ -177,17 +184,19 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
                             let session_cancel = cancel.child_token();
 
                             // Spawn bridge tasks
+                            let (tap_tx, tap_rx) = mpsc::channel(1);
                             let ping_handle =
                                 tokio::spawn(ping_listener(stack.clone(), session_cancel.clone()));
-                            let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
-                                stack.clone(),
+                            let tap_reader_handle = tokio::spawn(tap_reader(
                                 tap.clone(),
-                                peer,
+                                tap_tx,
                                 session_cancel.clone(),
                             ));
-                            let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(
+                            let exchange_handle = tokio::spawn(wifi_exchange(
                                 stack,
                                 tap.clone(),
+                                peer,
+                                tap_rx,
                                 session_cancel.clone(),
                             ));
 
@@ -201,12 +210,12 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
                                     info!("Ping listener ended, assuming disconnect");
                                     session_cancel.cancel();
                                 }
-                                _ = tap_to_wifi_handle => {
-                                    info!("TAP to WiFi task ended, assuming disconnect");
+                                _ = tap_reader_handle => {
+                                    info!("TAP reader task ended, assuming disconnect");
                                     session_cancel.cancel();
                                 }
-                                _ = wifi_to_tap_handle => {
-                                    info!("WiFi to TAP task ended, assuming disconnect");
+                                _ = exchange_handle => {
+                                    info!("WiFi exchange task ended, assuming disconnect");
                                     session_cancel.cancel();
                                 }
                             }
@@ -276,14 +285,14 @@ async fn ping_listener(stack: RouterStack, cancel: CancellationToken) {
     }
 }
 
-/// Forward frames from TAP interface to ESP32-C3 via WiFi
-async fn tap_to_wifi(
-    stack: RouterStack,
+/// Read frames from TAP into a small bounded queue. The queue preserves
+/// backpressure while the exchange task waits for the radio acknowledgement.
+async fn tap_reader(
     tap_device: Arc<AsyncDevice>,
-    peer: Address,
+    tx: mpsc::Sender<WifiFrame>,
     cancel: CancellationToken,
 ) {
-    info!("TAP to WiFi forwarder started");
+    info!("TAP reader started");
 
     let mut buf = [0u8; MAX_FRAME_SIZE];
 
@@ -308,52 +317,119 @@ async fn tap_to_wifi(
                     }
                 };
 
-                let request = stack
-                    .endpoints()
-                    .request::<WifiTxEndpoint>(peer, &frame, None);
                 select! {
-                    result = request => {
-                        if let Err(e) = result {
-                            warn!("WiFi TX request failed: {:?}", e);
+                    result = tx.send(frame) => {
+                        if result.is_err() {
+                            warn!("WiFi exchange queue closed");
+                            break;
                         }
                     }
                     _ = cancel.cancelled() => {
-                        info!("TAP to WiFi forwarder shutting down");
+                        info!("TAP reader shutting down");
                         break;
                     }
                 }
             }
             _ = cancel.cancelled() => {
-                info!("TAP to WiFi forwarder shutting down");
+                info!("TAP reader shutting down");
                 break;
             }
         }
     }
 }
 
-/// Forward frames from ESP32-C3 WiFi to TAP interface
-async fn wifi_to_tap(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: CancellationToken) {
-    info!("WiFi to TAP forwarder started");
-
-    let subber = stack
-        .topics()
-        .heap_bounded_receiver::<WifiRxTopic>(64, None);
-    let subber = pin!(subber);
-    let mut hdl = subber.subscribe();
+/// Serialize TX requests and short RX polls through one request owner.
+async fn wifi_exchange(
+    stack: RouterStack,
+    tap_device: Arc<AsyncDevice>,
+    peer: Address,
+    mut tap_rx: mpsc::Receiver<WifiFrame>,
+    cancel: CancellationToken,
+) {
+    info!("WiFi exchange task started");
+    let session = serial_session_id();
+    let mut next_transaction_id = 0u32;
 
     loop {
-        select! {
-            msg = hdl.recv() => {
-                if let Err(e) = tap_device.send(&msg.t.data).await {
-                    error!("TAP write error: {:?}", e);
+        if let Ok(frame) = tap_rx.try_recv() {
+            let transaction = WifiTransaction {
+                session,
+                id: next_transaction_id,
+            };
+            next_transaction_id = next_transaction_id.wrapping_add(1);
+            let request = WifiTxRequest { transaction, frame };
+
+            loop {
+                let response = stack
+                    .endpoints()
+                    .request::<WifiTxEndpoint>(peer, &request, None);
+                select! {
+                    result = response => match result {
+                        Ok(response) if response.transaction == transaction => break,
+                        Ok(response) => warn!(
+                            "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
+                            transaction, response.transaction
+                        ),
+                        Err(e) => warn!("WiFi TX request failed: {:?}", e),
+                    },
+                    _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                        warn!("WiFi TX response timed out; retrying transaction {:?}", transaction);
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("WiFi exchange task shutting down");
+                        return;
+                    }
                 }
             }
-            _ = cancel.cancelled() => {
-                info!("WiFi to TAP forwarder shutting down");
-                break;
+        }
+
+        let transaction = WifiTransaction {
+            session,
+            id: next_transaction_id,
+        };
+        next_transaction_id = next_transaction_id.wrapping_add(1);
+        let request = WifiRxRequest { transaction };
+
+        loop {
+            let response = stack
+                .endpoints()
+                .request::<WifiRxEndpoint>(peer, &request, None);
+            select! {
+                result = response => match result {
+                    Ok(response) if response.transaction == transaction => {
+                        if let Some(frame) = response.frame
+                            && let Err(e) = tap_device.send(&frame.data).await
+                        {
+                            error!("TAP write error: {:?}", e);
+                        }
+                        break;
+                    }
+                    Ok(response) => warn!(
+                        "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
+                        transaction, response.transaction
+                    ),
+                    Err(e) => warn!("WiFi RX request failed: {:?}", e),
+                },
+                _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                    warn!("WiFi RX response timed out; retrying transaction {:?}", transaction);
+                }
+                _ = cancel.cancelled() => {
+                    info!("WiFi exchange task shutting down");
+                    return;
+                }
             }
         }
     }
+}
+
+fn serial_session_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    now ^ u64::from(std::process::id()).rotate_left(32)
 }
 
 // ============================================================================

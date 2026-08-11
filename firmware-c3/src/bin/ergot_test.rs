@@ -23,7 +23,10 @@ use esp_hal::{
     usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
 };
 use heapless::Vec as HVec;
-use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxEndpoint};
+use icd::{
+    GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxEndpoint, WifiRxResponse, WifiTransaction,
+    WifiTxEndpoint, WifiTxResponse,
+};
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
 use panic_rtt_target as _;
 use static_cell::ConstStaticCell;
@@ -32,7 +35,7 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const OUT_QUEUE_SIZE: usize = 4096; // Optimal for ESP32-C3 USB Serial/JTAG bidirectional throughput
+const OUT_QUEUE_SIZE: usize = 8192;
 const MAX_PACKET_SIZE: usize = 2048;
 
 type AppDriver = UsbSerialJtagRx<'static, Async>;
@@ -115,7 +118,23 @@ async fn run_tx(mut tx: UsbSerialJtagTx<'static, Async>) {
         let data = rx.wait_read().await;
         let len = data.len();
         match Write::write(&mut tx, &data).await {
-            Ok(used) => data.release(used),
+            Ok(0) => {
+                data.release(0);
+                warn!("Serial TX wrote zero bytes");
+            }
+            Ok(used) => {
+                data.release(used);
+                // End an exact-64-byte USB transfer with an empty COBS frame.
+                // The empty frame is ignored by the receiver and gives the
+                // host a short packet to complete its read.
+                if used.is_multiple_of(64) {
+                    match Write::write(&mut tx, &[0]).await {
+                        Ok(1) => {}
+                        Ok(_) => warn!("Serial TX padding write was incomplete"),
+                        Err(_) => warn!("Serial TX padding write failed"),
+                    }
+                }
+            }
             Err(_) => {
                 warn!("Serial TX error");
                 data.release(len);
@@ -124,7 +143,7 @@ async fn run_tx(mut tx: UsbSerialJtagTx<'static, Async>) {
 
         // Yield periodically to allow RX task to run - critical for bidirectional
         tx_count = tx_count.wrapping_add(1);
-        if tx_count % 5 == 0 {
+        if tx_count.is_multiple_of(5) {
             yield_now().await;
         }
     }
@@ -148,16 +167,22 @@ async fn mac_server(mac: [u8; 6]) {
     }
 }
 
-/// Send frames as fast as possible once connected
+/// Return frames as fast as the host asks for them.
 #[task]
 async fn frame_sender() {
+    // Register the endpoint before the link becomes active so an early host
+    // request cannot be lost while this task is still waiting for discovery.
+    let server = STACK.endpoints().bounded_server::<WifiRxEndpoint, 16>(None);
+    let server = pin!(server);
+    let mut hdl = server.attach();
+
     // Wait for ergot connection
     info!("Waiting for ergot connection...");
     let mut counter = 0u32;
     loop {
         let state = STACK.manage_profile(|im| im.interface_state(()));
         counter += 1;
-        if counter % 50 == 0 {
+        if counter.is_multiple_of(50) {
             info!("Interface state: {:?}", state);
         }
         if matches!(state, Some(InterfaceState::Active { .. })) {
@@ -171,7 +196,8 @@ async fn frame_sender() {
     Timer::after(Duration::from_secs(3)).await;
     info!("Starting frame transmission...");
 
-    // Create a 1400-byte frame
+    // Create a 1400-byte frame and return one only when the host asks for it.
+    // This mirrors the production C3 flow control without involving WiFi.
     let mut frame_data = HVec::<u8, MAX_FRAME_SIZE>::new();
     frame_data.resize(1400, 0xAB).ok();
     let frame = WifiFrame { data: frame_data };
@@ -179,92 +205,106 @@ async fn frame_sender() {
     let mut total_bytes: u64 = 0;
     let mut last_report = Instant::now();
     let mut frame_count: u32 = 0;
+    let mut cached_response: Option<WifiRxResponse> = None;
 
     loop {
-        match STACK.topics().broadcast::<WifiRxTopic>(&frame, None) {
-            Ok(_) => {
-                total_bytes += 1400;
-                frame_count = frame_count.wrapping_add(1);
+        let mut sent_new_frame = false;
+        match hdl
+            .serve(async |req| {
+                if let Some(response) = cached_response.as_ref()
+                    && response.transaction == req.transaction
+                {
+                    return response.clone();
+                }
+                sent_new_frame = true;
+                let response = WifiRxResponse {
+                    transaction: req.transaction,
+                    frame: Some(frame.clone()),
+                };
+                cached_response = Some(response.clone());
+                response
+            })
+            .await
+        {
+            Ok(()) => {
+                if sent_new_frame {
+                    total_bytes += 1400;
+                    frame_count = frame_count.wrapping_add(1);
+                }
             }
-            Err(_) => {
+            Err(err) => {
+                warn!("Frame sender endpoint error: {:?}", err);
                 Timer::after(Duration::from_millis(10)).await;
                 continue;
             }
         }
 
-        // Every 5 frames, pause briefly to allow RX to process
-        // Combined with 4KB queue, this provides good bidirectional fairness
-        if frame_count % 5 == 0 {
-            Timer::after(Duration::from_millis(1)).await;
-        }
-
         if last_report.elapsed() > Duration::from_secs(5) {
-            let elapsed_ms = last_report.elapsed().as_millis() as u64;
-            let kbps = if elapsed_ms > 0 {
-                (total_bytes * 8 * 1000) / elapsed_ms / 1000
-            } else {
-                0
-            };
+            let elapsed_ms = last_report.elapsed().as_millis();
+            let kbps = (total_bytes * 8).checked_div(elapsed_ms).unwrap_or(0);
             info!(
-                "TX throughput: {} KB sent, {} kbps",
+                "TX throughput: {} frames, {} KB sent, {} kbps",
+                frame_count,
                 total_bytes / 1024,
-                kbps
+                kbps,
             );
             total_bytes = 0;
+            frame_count = 0;
             last_report = Instant::now();
         }
     }
 }
 
-/// Receive frames from host and count throughput
+/// Receive frames from the host. Register immediately so the first request
+/// cannot race service startup after MAC discovery.
 #[task]
 async fn frame_receiver() {
-    // Wait for ergot connection
-    loop {
-        let is_active = STACK.manage_profile(|im| {
-            matches!(im.interface_state(()), Some(InterfaceState::Active { .. }))
-        });
-        if is_active {
-            break;
-        }
-        Timer::after(Duration::from_millis(100)).await;
-    }
-
     let server = STACK.endpoints().bounded_server::<WifiTxEndpoint, 16>(None);
     let server = pin!(server);
     let mut hdl = server.attach();
 
-    info!("Frame receiver started, waiting for frames from host...");
-
     let mut total_bytes: u64 = 0;
-    let mut total_frames: u64 = 0;
+    let mut total_frames: u32 = 0;
     let mut last_report = Instant::now();
+    let mut last_completed: Option<WifiTransaction> = None;
 
     loop {
         let mut frame_len = 0;
-        if hdl
-            .serve(async |frame| {
-                frame_len = frame.data.len();
+        let mut received_new_frame = false;
+        match hdl
+            .serve(async |request| {
+                if last_completed != Some(request.transaction) {
+                    frame_len = request.frame.data.len();
+                    last_completed = Some(request.transaction);
+                    received_new_frame = true;
+                }
+                WifiTxResponse {
+                    transaction: request.transaction,
+                }
             })
             .await
-            .is_ok()
         {
-            total_frames += 1;
-            total_bytes += frame_len as u64;
+            Ok(()) => {
+                if received_new_frame {
+                    total_frames = total_frames.wrapping_add(1);
+                    total_bytes += frame_len as u64;
+                }
+            }
+            Err(err) => {
+                warn!("Frame receiver endpoint error: {:?}", err);
+                Timer::after(Duration::from_millis(10)).await;
+                continue;
+            }
         }
 
         if last_report.elapsed() > Duration::from_secs(5) {
-            let elapsed_ms = last_report.elapsed().as_millis() as u64;
-            let kbps = if elapsed_ms > 0 {
-                (total_bytes * 8 * 1000) / elapsed_ms / 1000
-            } else {
-                0
-            };
+            let elapsed_ms = last_report.elapsed().as_millis();
+            let kbps = (total_bytes * 8).checked_div(elapsed_ms).unwrap_or(0);
             info!(
                 "RX throughput: {} frames, {} KB received, {} kbps",
                 total_frames,
                 total_bytes / 1024,
-                kbps
+                kbps,
             );
             total_bytes = 0;
             total_frames = 0;
