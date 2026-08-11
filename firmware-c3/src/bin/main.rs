@@ -29,9 +29,12 @@ use esp_hal::{
     Async,
     clock::CpuClock,
     timer::timg::TimerGroup,
-    usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
+    usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
 };
-use esp_radio::wifi::{ModeConfig, WifiController, WifiDevice, WifiEvent, sta::StationConfig};
+use esp_radio::wifi::{
+    Config as WifiConfig, ControllerConfig, Interface as WifiInterface, WifiController,
+    sta::StationConfig,
+};
 use heapless::Vec as HVec;
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxEndpoint};
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
@@ -87,12 +90,21 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("Embassy initialized!");
 
-    // Initialize Wi-Fi radio
-    let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, Default::default())
-        .expect("Failed to initialize Wi-Fi");
+    // Configure and start the station interface.
+    let station_config = WifiConfig::Station(
+        StationConfig::default()
+            .with_ssid(SSID)
+            .with_password(PASSWORD.into()),
+    );
+    let wifi_controller = WifiController::new(
+        peripherals.WIFI,
+        ControllerConfig::default().with_initial_config(station_config),
+    )
+    .expect("Failed to initialize Wi-Fi");
+    let wifi_interface = WifiInterface::station();
 
     // Get WiFi MAC address before moving the device
-    let wifi_mac = interfaces.station.mac_address();
+    let wifi_mac = wifi_interface.mac_address();
     info!(
         "WiFi MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         wifi_mac[0], wifi_mac[1], wifi_mac[2], wifi_mac[3], wifi_mac[4], wifi_mac[5]
@@ -115,19 +127,19 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // Spawn I/O worker tasks
-    spawner.must_spawn(run_rx(rxvr, RECV_BUF.take(), SCRATCH_BUF.take()));
-    spawner.must_spawn(run_tx(tx));
+    spawner.spawn(run_rx(rxvr, RECV_BUF.take(), SCRATCH_BUF.take()).unwrap());
+    spawner.spawn(run_tx(tx).unwrap());
 
     // Spawn ergot service tasks
-    spawner.must_spawn(pingserver());
-    spawner.must_spawn(mac_server(wifi_mac));
-    spawner.must_spawn(wifi_tx_server());
+    spawner.spawn(pingserver().unwrap());
+    spawner.spawn(mac_server(wifi_mac).unwrap());
+    spawner.spawn(wifi_tx_server().unwrap());
 
     // Spawn WiFi tasks
-    spawner.must_spawn(wifi_connection(wifi_controller));
-    spawner.must_spawn(keepalive());
-    spawner.must_spawn(wifi_to_host_forwarder());
-    spawner.must_spawn(wifi_bridge(interfaces.station));
+    spawner.spawn(wifi_connection(wifi_controller).unwrap());
+    spawner.spawn(keepalive().unwrap());
+    spawner.spawn(wifi_to_host_forwarder().unwrap());
+    spawner.spawn(wifi_bridge(wifi_interface).unwrap());
 
     // Keep main task alive
     loop {
@@ -285,40 +297,21 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
     info!("Connecting to SSID: {}", SSID);
 
     loop {
-        if controller.is_connected().unwrap_or(false) {
-            WIFI_CONNECTED.store(true, Ordering::Relaxed);
-            info!("WiFi connected, waiting for disconnect event...");
-            controller
-                .wait_for_event(WifiEvent::StationDisconnected)
-                .await;
-            WIFI_CONNECTED.store(false, Ordering::Relaxed);
-            info!("WiFi disconnected!");
-            Timer::after(Duration::from_millis(5000)).await;
-        }
-
-        if !matches!(controller.is_started(), Ok(true)) {
-            let station_config = ModeConfig::Station(
-                StationConfig::default()
-                    .with_ssid(SSID.into())
-                    .with_password(PASSWORD.into()),
-            );
-            controller.set_config(&station_config).unwrap();
-            info!("Starting WiFi...");
-            controller.start_async().await.unwrap();
-            info!("WiFi started!");
-        }
-
         info!("Connecting to AP...");
         match controller.connect_async().await {
-            Ok(_) => {
+            Ok(info) => {
                 WIFI_CONNECTED.store(true, Ordering::Relaxed);
-                info!("WiFi connected to {}!", SSID);
+                info!("WiFi connected to {}: {:?}", SSID, info);
+                let disconnected = controller.wait_for_disconnect_async().await;
+                WIFI_CONNECTED.store(false, Ordering::Relaxed);
+                info!("WiFi disconnected: {:?}", disconnected);
             }
             Err(e) => {
+                WIFI_CONNECTED.store(false, Ordering::Relaxed);
                 info!("Failed to connect: {:?}", e);
-                Timer::after(Duration::from_millis(5000)).await;
             }
         }
+        Timer::after(Duration::from_millis(5000)).await;
     }
 }
 
@@ -329,7 +322,7 @@ enum WifiTxWaitEvent {
 
 /// Wait for a real WiFi TX token. While the TX queue is full, continue draining
 /// radio RX so bidirectional traffic cannot deadlock the driver.
-async fn transmit_to_wifi(wifi_device: &mut WifiDevice<'static>, frame: &WifiFrame) -> u32 {
+async fn transmit_to_wifi(wifi_device: &mut WifiInterface, frame: &WifiFrame) -> u32 {
     let mut received_while_waiting = 0;
 
     loop {
@@ -369,7 +362,7 @@ async fn transmit_to_wifi(wifi_device: &mut WifiDevice<'static>, frame: &WifiFra
 
 /// Bidirectional WiFi bridge - forwards frames between WiFi and ergot/USB
 #[task]
-async fn wifi_bridge(mut wifi_device: WifiDevice<'static>) {
+async fn wifi_bridge(mut wifi_device: WifiInterface) {
     info!("WiFi bridge task started");
 
     // Wait for WiFi to connect

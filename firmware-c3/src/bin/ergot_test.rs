@@ -20,7 +20,7 @@ use esp_hal::{
     Async,
     clock::CpuClock,
     timer::timg::TimerGroup,
-    usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
+    usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
 };
 use heapless::Vec as HVec;
 use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxEndpoint};
@@ -64,9 +64,10 @@ async fn main(spawner: Spawner) -> ! {
     info!("Ergot throughput test starting...");
 
     // Initialize Wi-Fi just to make RTT work (known issue with esp-hal)
-    let (_wifi_controller, _interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default())
+    let _wifi_controller =
+        esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi");
+    let _wifi_interface = esp_radio::wifi::Interface::station();
 
     info!("WiFi initialized (for RTT)");
 
@@ -84,12 +85,12 @@ async fn main(spawner: Spawner) -> ! {
         (),
     );
 
-    spawner.must_spawn(run_rx(rxvr, RECV_BUF.take(), SCRATCH_BUF.take()));
-    spawner.must_spawn(run_tx(tx));
-    spawner.must_spawn(pingserver());
-    spawner.must_spawn(mac_server([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]));
-    spawner.must_spawn(frame_sender());
-    spawner.must_spawn(frame_receiver());
+    spawner.spawn(run_rx(rxvr, RECV_BUF.take(), SCRATCH_BUF.take()).unwrap());
+    spawner.spawn(run_tx(tx).unwrap());
+    spawner.spawn(pingserver().unwrap());
+    spawner.spawn(mac_server([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]).unwrap());
+    spawner.spawn(frame_sender().unwrap());
+    spawner.spawn(frame_receiver().unwrap());
 
     loop {
         Timer::after(Duration::from_secs(60)).await;
@@ -229,9 +230,7 @@ async fn frame_receiver() {
         Timer::after(Duration::from_millis(100)).await;
     }
 
-    let server = STACK
-        .endpoints()
-        .bounded_server::<WifiTxEndpoint, 16>(None);
+    let server = STACK.endpoints().bounded_server::<WifiTxEndpoint, 16>(None);
     let server = pin!(server);
     let mut hdl = server.attach();
 

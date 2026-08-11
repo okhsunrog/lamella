@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ergot = { path = "/home/okhsunrog/code/rust/ergot/crates/ergot" }
+ergot = { git = "https://github.com/jamesmunns/ergot", rev = "5a5fab8234339ecdc252e18c41ef2676bd6bb091" }
 postcard-schema = { version = "0.2", features = ["derive", "heapless-v0_9"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 heapless = { version = "0.9", features = ["serde"] }

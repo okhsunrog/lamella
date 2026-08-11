@@ -4,8 +4,8 @@
 //!   usb_raw_test <port> [mode]
 //!   mode: rx (receive only), tx (send only), bidir (both, default)
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::SerialPortBuilderExt;
@@ -41,7 +41,7 @@ async fn main() {
 
     let mode_str = match mode {
         Mode::RxOnly => "rx",
-        Mode::TxOnly => "tx", 
+        Mode::TxOnly => "tx",
         Mode::Bidir => "bidir",
     };
     println!("Opening {}... (mode: {})", port_name, mode_str);

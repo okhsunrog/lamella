@@ -12,7 +12,7 @@ use esp_hal::{
     Async,
     clock::CpuClock,
     timer::timg::TimerGroup,
-    usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
+    usb::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
 };
 use panic_rtt_target as _;
 
@@ -37,9 +37,10 @@ async fn main(spawner: Spawner) -> ! {
     info!("Raw USB throughput test starting...");
 
     // Initialize Wi-Fi just to make RTT work (known issue with esp-hal)
-    let (_wifi_controller, _interfaces) =
-        esp_radio::wifi::new(peripherals.WIFI, Default::default())
+    let _wifi_controller =
+        esp_radio::wifi::WifiController::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi");
+    let _wifi_interface = esp_radio::wifi::Interface::station();
 
     info!("WiFi initialized (for RTT)");
 
@@ -49,8 +50,8 @@ async fn main(spawner: Spawner) -> ! {
 
     info!("USB Serial/JTAG initialized, starting TX and RX tasks...");
 
-    spawner.must_spawn(tx_task(tx));
-    spawner.must_spawn(rx_task(rx));
+    spawner.spawn(tx_task(tx).unwrap());
+    spawner.spawn(rx_task(rx).unwrap());
 
     loop {
         Timer::after(Duration::from_secs(60)).await;
@@ -62,7 +63,7 @@ async fn main(spawner: Spawner) -> ! {
 async fn tx_task(mut tx: UsbSerialJtagTx<'static, Async>) {
     // 4KB buffer filled with 0xAB
     let buf = [0xABu8; 4096];
-    
+
     let mut total_bytes: u64 = 0;
     let mut last_report = Instant::now();
 
@@ -100,7 +101,7 @@ async fn tx_task(mut tx: UsbSerialJtagTx<'static, Async>) {
 async fn rx_task(mut rx: UsbSerialJtagRx<'static, Async>) {
     // 4KB receive buffer
     let mut buf = [0u8; 4096];
-    
+
     let mut total_bytes: u64 = 0;
     let mut last_report = Instant::now();
 
