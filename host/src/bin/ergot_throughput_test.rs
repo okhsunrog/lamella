@@ -1,7 +1,7 @@
 //! Ergot bidirectional throughput test
 //!
 //! Usage:
-//!   ergot_throughput_test <port> [mode]
+//!   ergot_throughput_test <port> [mode] [duration-seconds]
 //!   mode: rx (receive only), tx (send only), bidir (both, default)
 
 use ergot::Address;
@@ -18,6 +18,32 @@ use std::time::{Duration, Instant};
 const MAX_ERGOT_PACKET_SIZE: u16 = 2048;
 const TX_BUFFER_SIZE: usize = 65536;
 const ESP32_NODE_ID: u8 = 2;
+const TEST_FRAME_SIZE: usize = 1400;
+const HOST_FRAME_BYTE: u8 = 0xCD;
+const DEVICE_FRAME_BYTE: u8 = 0xAB;
+
+#[derive(Default)]
+struct Stats {
+    rx_bytes: AtomicU64,
+    rx_frames: AtomicU64,
+    rx_retries: AtomicU64,
+    rx_timeouts: AtomicU64,
+    rx_endpoint_errors: AtomicU64,
+    rx_response_mismatches: AtomicU64,
+    rx_integrity_errors: AtomicU64,
+    tx_bytes: AtomicU64,
+    tx_frames: AtomicU64,
+    tx_retries: AtomicU64,
+    tx_timeouts: AtomicU64,
+    tx_endpoint_errors: AtomicU64,
+    tx_response_mismatches: AtomicU64,
+}
+
+impl Stats {
+    fn failure_count(&self) -> u64 {
+        self.rx_retries.load(Ordering::Relaxed) + self.tx_retries.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -32,9 +58,9 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <serial-port> [mode]", args[0]);
+        eprintln!("Usage: {} <serial-port> [mode] [duration-seconds]", args[0]);
         eprintln!("  mode: rx (receive only), tx (send only), bidir (both, default)");
-        eprintln!("Example: {} /dev/ttyACM0 bidir", args[0]);
+        eprintln!("Example: {} /dev/ttyACM0 bidir 300", args[0]);
         std::process::exit(1);
     }
 
@@ -49,6 +75,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let duration = args.get(3).map(|value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| {
+                eprintln!("Invalid duration: {value}. Use a positive number of seconds");
+                std::process::exit(1);
+            })
+    });
 
     println!(
         "Opening {}... (mode: {:?})",
@@ -87,24 +124,17 @@ async fn main() {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
 
-    // Stats counters
-    let rx_bytes = Arc::new(AtomicU64::new(0));
-    let rx_frames = Arc::new(AtomicU64::new(0));
-    let tx_bytes = Arc::new(AtomicU64::new(0));
-    let tx_frames = Arc::new(AtomicU64::new(0));
+    let stats = Arc::new(Stats::default());
 
     // One task owns the endpoint request path. Concurrent requests on the same
     // Ergot stream can block one another before either response is delivered.
     {
         let stack_clone = stack.clone();
-        let rx_bytes_clone = rx_bytes.clone();
-        let rx_frames_clone = rx_frames.clone();
-        let tx_bytes_clone = tx_bytes.clone();
-        let tx_frames_clone = tx_frames.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             // Create a 1400-byte frame
             let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
-            frame_data.resize(1400, 0xCD).ok();
+            frame_data.resize(TEST_FRAME_SIZE, HOST_FRAME_BYTE).ok();
             let frame = WifiFrame { data: frame_data };
 
             let mut frame_count = 0u32;
@@ -132,12 +162,25 @@ async fn main() {
                         .await
                         {
                             Ok(Ok(response)) if response.transaction == transaction => break,
-                            _ => continue,
+                            Ok(Ok(_)) => {
+                                stats.tx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.tx_response_mismatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(Err(_)) => {
+                                stats.tx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.tx_endpoint_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                stats.tx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.tx_timeouts.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     {
-                        tx_frames_clone.fetch_add(1, Ordering::Relaxed);
-                        tx_bytes_clone.fetch_add(1400, Ordering::Relaxed);
+                        stats.tx_frames.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .tx_bytes
+                            .fetch_add(TEST_FRAME_SIZE as u64, Ordering::Relaxed);
                         frame_count = frame_count.wrapping_add(1);
                     }
                 }
@@ -159,14 +202,35 @@ async fn main() {
                         .await
                         {
                             Ok(Ok(response)) if response.transaction == transaction => {
-                                break response;
+                                let valid = response.frame.as_ref().is_some_and(|frame| {
+                                    frame.data.len() == TEST_FRAME_SIZE
+                                        && frame.data.iter().all(|byte| *byte == DEVICE_FRAME_BYTE)
+                                });
+                                if valid {
+                                    break response;
+                                }
+                                stats.rx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.rx_integrity_errors.fetch_add(1, Ordering::Relaxed);
                             }
-                            _ => continue,
+                            Ok(Ok(_)) => {
+                                stats.rx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.rx_response_mismatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(Err(_)) => {
+                                stats.rx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.rx_endpoint_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                stats.rx_retries.fetch_add(1, Ordering::Relaxed);
+                                stats.rx_timeouts.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     };
                     if let Some(frame) = response.frame {
-                        rx_frames_clone.fetch_add(1, Ordering::Relaxed);
-                        rx_bytes_clone.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+                        stats.rx_frames.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .rx_bytes
+                            .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
                     }
                 }
 
@@ -193,10 +257,10 @@ async fn main() {
         let elapsed = last_report.elapsed().as_secs_f64();
         let total_elapsed = start.elapsed().as_secs_f64();
 
-        let curr_rx_bytes = rx_bytes.load(Ordering::Relaxed);
-        let curr_tx_bytes = tx_bytes.load(Ordering::Relaxed);
-        let curr_rx_frames = rx_frames.load(Ordering::Relaxed);
-        let curr_tx_frames = tx_frames.load(Ordering::Relaxed);
+        let curr_rx_bytes = stats.rx_bytes.load(Ordering::Relaxed);
+        let curr_tx_bytes = stats.tx_bytes.load(Ordering::Relaxed);
+        let curr_rx_frames = stats.rx_frames.load(Ordering::Relaxed);
+        let curr_tx_frames = stats.tx_frames.load(Ordering::Relaxed);
 
         let rx_delta = curr_rx_bytes - last_rx_bytes;
         let tx_delta = curr_tx_bytes - last_tx_bytes;
@@ -225,10 +289,41 @@ async fn main() {
                 tx_avg_mbps
             );
         }
+        println!(
+            "  Errors: RX retries={} timeouts={} endpoint={} mismatch={} integrity={} | TX retries={} timeouts={} endpoint={} mismatch={}",
+            stats.rx_retries.load(Ordering::Relaxed),
+            stats.rx_timeouts.load(Ordering::Relaxed),
+            stats.rx_endpoint_errors.load(Ordering::Relaxed),
+            stats.rx_response_mismatches.load(Ordering::Relaxed),
+            stats.rx_integrity_errors.load(Ordering::Relaxed),
+            stats.tx_retries.load(Ordering::Relaxed),
+            stats.tx_timeouts.load(Ordering::Relaxed),
+            stats.tx_endpoint_errors.load(Ordering::Relaxed),
+            stats.tx_response_mismatches.load(Ordering::Relaxed),
+        );
 
         last_rx_bytes = curr_rx_bytes;
         last_tx_bytes = curr_tx_bytes;
         last_report = Instant::now();
+
+        if duration.is_some_and(|duration| start.elapsed() >= duration) {
+            break;
+        }
+    }
+
+    let failures = stats.failure_count();
+    println!(
+        "FINAL RX: {} frames, {} bytes; TX: {} frames, {} bytes",
+        stats.rx_frames.load(Ordering::Relaxed),
+        stats.rx_bytes.load(Ordering::Relaxed),
+        stats.tx_frames.load(Ordering::Relaxed),
+        stats.tx_bytes.load(Ordering::Relaxed),
+    );
+    if failures == 0 {
+        println!("RESULT PASS: zero retries, timeouts, response mismatches, or payload errors");
+    } else {
+        eprintln!("RESULT FAIL: {failures} retry/integrity events");
+        std::process::exit(2);
     }
 }
 

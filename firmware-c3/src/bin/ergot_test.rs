@@ -13,7 +13,7 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async_0_7::Write;
 use ergot::{
     exports::bbqueue::traits::coordination::cs::CsCoord,
-    interface_manager::{InterfaceState, Profile},
+    interface_manager::InterfaceState,
     toolkits::embedded_io_async_v0_7::{self as kit},
 };
 use esp_hal::{
@@ -37,6 +37,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 const OUT_QUEUE_SIZE: usize = 8192;
 const MAX_PACKET_SIZE: usize = 2048;
+const TEST_FRAME_SIZE: usize = 1400;
+const HOST_FRAME_BYTE: u8 = 0xCD;
 
 type AppDriver = UsbSerialJtagRx<'static, Async>;
 type RxWorker = ergot::interface_manager::transports::eio::RxWorker<
@@ -169,30 +171,10 @@ async fn frame_sender() {
     let server = pin!(server);
     let mut hdl = server.attach();
 
-    // Wait for ergot connection
-    info!("Waiting for ergot connection...");
-    let mut counter = 0u32;
-    loop {
-        let state = STACK.manage_profile(|im| im.interface_state(()));
-        counter += 1;
-        if counter.is_multiple_of(50) {
-            info!("Interface state: {:?}", state);
-        }
-        if matches!(state, Some(InterfaceState::Active { .. })) {
-            break;
-        }
-        Timer::after(Duration::from_millis(100)).await;
-    }
-    info!("Ergot connection established!");
-
-    // Wait for host to complete initial setup (MAC query, etc)
-    Timer::after(Duration::from_secs(3)).await;
-    info!("Starting frame transmission...");
-
     // Create a 1400-byte frame and return one only when the host asks for it.
     // This mirrors the production C3 flow control without involving WiFi.
     let mut frame_data = HVec::<u8, MAX_FRAME_SIZE>::new();
-    frame_data.resize(1400, 0xAB).ok();
+    frame_data.resize(TEST_FRAME_SIZE, 0xAB).ok();
     let frame = WifiFrame { data: frame_data };
 
     let mut total_bytes: u64 = 0;
@@ -221,7 +203,7 @@ async fn frame_sender() {
         {
             Ok(()) => {
                 if sent_new_frame {
-                    total_bytes += 1400;
+                    total_bytes += TEST_FRAME_SIZE as u64;
                     frame_count = frame_count.wrapping_add(1);
                 }
             }
@@ -264,12 +246,29 @@ async fn frame_receiver() {
     loop {
         let mut frame_len = 0;
         let mut received_new_frame = false;
+        let mut invalid_payload = false;
         match hdl
             .serve(async |request| {
                 if last_completed != Some(request.transaction) {
                     frame_len = request.frame.data.len();
-                    last_completed = Some(request.transaction);
-                    received_new_frame = true;
+                    if frame_len == TEST_FRAME_SIZE
+                        && request
+                            .frame
+                            .data
+                            .iter()
+                            .all(|byte| *byte == HOST_FRAME_BYTE)
+                    {
+                        last_completed = Some(request.transaction);
+                        received_new_frame = true;
+                    } else {
+                        invalid_payload = true;
+                        return WifiTxResponse {
+                            transaction: WifiTransaction {
+                                session: request.transaction.session,
+                                id: request.transaction.id.wrapping_add(1),
+                            },
+                        };
+                    }
                 }
                 WifiTxResponse {
                     transaction: request.transaction,
@@ -278,6 +277,9 @@ async fn frame_receiver() {
             .await
         {
             Ok(()) => {
+                if invalid_payload {
+                    warn!("Invalid host frame payload: {} bytes", frame_len);
+                }
                 if received_new_frame {
                     total_frames = total_frames.wrapping_add(1);
                     total_bytes += frame_len as u64;
