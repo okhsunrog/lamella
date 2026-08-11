@@ -152,7 +152,7 @@ fn coarse_device_filter(info: &nusb::DeviceInfo) -> bool {
 async fn reconcile_and_register_devices(
     stack: &RouterStack,
     seen: &mut HashSet<ErgotDeviceInfo>,
-) -> Vec<(u64, ErgotDeviceInfo)> {
+) -> Vec<(u8, ErgotDeviceInfo)> {
     if let Some(connected) = current_device_infos() {
         seen.retain(|info| connected.contains(info));
     }
@@ -224,8 +224,7 @@ async fn tap_to_wifi(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: C
 
                 if let Err(e) = stack
                     .topics()
-                    .broadcast_wait::<WifiTxTopic>(&frame, None)
-                    .await
+                    .broadcast::<WifiTxTopic>(&frame, None)
                 {
                     warn!("WiFi broadcast failed: {:?}", e);
                 }
@@ -343,15 +342,14 @@ pub async fn run_test_mode(
                 "Invalid bandwidth target format. Use IP:PORT (e.g., 10.77.77.100:5000)",
             ));
         }
-        let ip_parts: Vec<u8> = parts[0]
-            .split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let ip_parts: Vec<u8> = parts[0].split('.').filter_map(|s| s.parse().ok()).collect();
         if ip_parts.len() != 4 {
             return Err(io::Error::other("Invalid IP address"));
         }
         let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
-        let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
+        let server_port: u16 = parts[1]
+            .parse()
+            .map_err(|_| io::Error::other("Invalid port"))?;
 
         run_tcp_bandwidth_test(mac, rx_queue, tx_sender, server_ip, server_port, cancel).await
     } else {

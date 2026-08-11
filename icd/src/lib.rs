@@ -16,10 +16,14 @@ pub struct WifiFrame {
     pub data: Vec<u8, MAX_FRAME_SIZE>,
 }
 
+// Reliably hand one Ethernet frame to the ESP32 WiFi driver. The response is
+// sent only after the driver has accepted the frame for transmission.
+endpoint!(WifiTxEndpoint, WifiFrame, (), "wifi/tx");
+
 // Topic for frames coming from WiFi (ESP32-S3 publishes, host subscribes)
 topic!(WifiRxTopic, WifiFrame, "wifi/rx");
 
-// Topic for frames going to WiFi (host publishes, ESP32-S3 subscribes)
+// Legacy best-effort path used by the ESP32-S3 firmware.
 topic!(WifiTxTopic, WifiFrame, "wifi/tx");
 
 // Ping topic for testing

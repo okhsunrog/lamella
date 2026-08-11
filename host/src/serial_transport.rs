@@ -1,7 +1,10 @@
 //! Serial transport for ESP32-C3 with USB Serial/JTAG
 
-use ergot::toolkits::tokio_serial_v5::{RouterStack, register_router_interface};
-use icd::{MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
+use ergot::{
+    Address,
+    toolkits::tokio_serial_v5::{RouterStack, register_router_interface},
+};
+use icd::{MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxEndpoint};
 use log::{error, info, trace, warn};
 use std::{io, path::Path, pin::pin, sync::Arc, time::Duration};
 use tokio::{select, time::sleep};
@@ -61,6 +64,7 @@ async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::
     sleep(Duration::from_secs(2)).await;
 
     let expected_mac = bridge::query_mac_with_retry_serial(&stack, interface_id).await?;
+    let peer = bridge::serial_peer_address(&stack, interface_id)?;
     log_mac(&expected_mac);
 
     let tap_device = create_tap_interface(&expected_mac)?;
@@ -70,6 +74,7 @@ async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::
     let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
         stack.clone(),
         tap_device.clone(),
+        peer,
         cancel.clone(),
     ));
     let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(stack, tap_device, cancel.clone()));
@@ -131,6 +136,13 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
 
                 match bridge::query_mac_with_retry_serial(&stack, interface_id).await {
                     Ok(mac) => {
+                        let peer = match bridge::serial_peer_address(&stack, interface_id) {
+                            Ok(peer) => peer,
+                            Err(e) => {
+                                warn!("Failed to resolve ESP32 address: {:?}", e);
+                                continue;
+                            }
+                        };
                         if let Some(expected) = expected_mac {
                             if mac != expected {
                                 error!(
@@ -170,6 +182,7 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
                             let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
                                 stack.clone(),
                                 tap.clone(),
+                                peer,
                                 session_cancel.clone(),
                             ));
                             let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(
@@ -264,7 +277,12 @@ async fn ping_listener(stack: RouterStack, cancel: CancellationToken) {
 }
 
 /// Forward frames from TAP interface to ESP32-C3 via WiFi
-async fn tap_to_wifi(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: CancellationToken) {
+async fn tap_to_wifi(
+    stack: RouterStack,
+    tap_device: Arc<AsyncDevice>,
+    peer: Address,
+    cancel: CancellationToken,
+) {
     info!("TAP to WiFi forwarder started");
 
     let mut buf = [0u8; MAX_FRAME_SIZE];
@@ -290,12 +308,19 @@ async fn tap_to_wifi(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: C
                     }
                 };
 
-                if let Err(e) = stack
-                    .topics()
-                    .broadcast_wait::<WifiTxTopic>(&frame, None)
-                    .await
-                {
-                    warn!("WiFi broadcast failed: {:?}", e);
+                let request = stack
+                    .endpoints()
+                    .request::<WifiTxEndpoint>(peer, &frame, None);
+                select! {
+                    result = request => {
+                        if let Err(e) = result {
+                            warn!("WiFi TX request failed: {:?}", e);
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("TAP to WiFi forwarder shutting down");
+                        break;
+                    }
                 }
             }
             _ = cancel.cancelled() => {
@@ -345,7 +370,9 @@ pub async fn run_test_mode(
     http_target: Option<String>,
 ) -> io::Result<()> {
     match (port, by_id) {
-        (Some(port), None) => run_test_mode_with_port(port, baud, cancel, bandwidth_target, http_target).await,
+        (Some(port), None) => {
+            run_test_mode_with_port(port, baud, cancel, bandwidth_target, http_target).await
+        }
         (None, Some(pattern)) => {
             // For test mode, just wait for the device once
             info!("Test mode: waiting for device matching: {}", pattern);
@@ -354,7 +381,14 @@ pub async fn run_test_mode(
                     return Ok(());
                 }
                 if let Some(path) = find_device_by_id(pattern) {
-                    return run_test_mode_with_port(&path, baud, cancel, bandwidth_target, http_target).await;
+                    return run_test_mode_with_port(
+                        &path,
+                        baud,
+                        cancel,
+                        bandwidth_target,
+                        http_target,
+                    )
+                    .await;
                 }
                 sleep(Duration::from_millis(DEVICE_POLL_INTERVAL_MS)).await;
             }
@@ -377,7 +411,8 @@ async fn run_test_mode_with_port(
     http_target: Option<String>,
 ) -> io::Result<()> {
     use crate::test_mode::{
-        RxQueue, bridge_ergot_to_smoltcp_serial, run_smoltcp_stack, run_udp_bandwidth_test, run_http_download_test,
+        RxQueue, bridge_ergot_to_smoltcp_serial, run_http_download_test, run_smoltcp_stack,
+        run_udp_bandwidth_test,
     };
     use smoltcp::wire::Ipv4Address;
     use std::collections::VecDeque;
@@ -394,13 +429,16 @@ async fn run_test_mode_with_port(
     let interface_id =
         register_router_interface(&stack, port, baud, MAX_ERGOT_PACKET_SIZE, TX_BUFFER_SIZE)
             .await
-            .map_err(|e| io::Error::other(format!("Failed to register serial interface: {:?}", e)))?;
+            .map_err(|e| {
+                io::Error::other(format!("Failed to register serial interface: {:?}", e))
+            })?;
 
     info!("Serial interface registered (id: {})", interface_id);
 
     sleep(Duration::from_secs(2)).await;
 
     let mac = bridge::query_mac_with_retry_serial(&stack, interface_id).await?;
+    let peer = bridge::serial_peer_address(&stack, interface_id)?;
     crate::log_mac(&mac);
 
     // Create channels for smoltcp <-> ergot bridge
@@ -412,8 +450,14 @@ async fn run_test_mode_with_port(
     let bridge_stack = stack.clone();
     let bridge_rx_queue = rx_queue.clone();
     tokio::spawn(async move {
-        bridge_ergot_to_smoltcp_serial(bridge_stack, bridge_rx_queue, tx_receiver, bridge_cancel)
-            .await;
+        bridge_ergot_to_smoltcp_serial(
+            bridge_stack,
+            bridge_rx_queue,
+            tx_receiver,
+            peer,
+            bridge_cancel,
+        )
+        .await;
     });
 
     // Spawn ping listener for debugging
@@ -436,17 +480,25 @@ async fn run_test_mode_with_port(
         if parts.len() != 2 {
             return Err(io::Error::other("Invalid IP:PORT format"));
         }
-        let ip_parts: Vec<u8> = parts[0]
-            .split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let ip_parts: Vec<u8> = parts[0].split('.').filter_map(|s| s.parse().ok()).collect();
         if ip_parts.len() != 4 {
             return Err(io::Error::other("Invalid IP address"));
         }
         let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
-        let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
+        let server_port: u16 = parts[1]
+            .parse()
+            .map_err(|_| io::Error::other("Invalid port"))?;
 
-        run_http_download_test(mac, rx_queue, tx_sender, server_ip, server_port, &path, cancel).await
+        run_http_download_test(
+            mac,
+            rx_queue,
+            tx_sender,
+            server_ip,
+            server_port,
+            &path,
+            cancel,
+        )
+        .await
     } else if let Some(target) = bandwidth_target {
         // Parse IP:PORT
         let parts: Vec<&str> = target.split(':').collect();
@@ -455,15 +507,14 @@ async fn run_test_mode_with_port(
                 "Invalid bandwidth target format. Use IP:PORT (e.g., 10.77.77.100:5000)",
             ));
         }
-        let ip_parts: Vec<u8> = parts[0]
-            .split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let ip_parts: Vec<u8> = parts[0].split('.').filter_map(|s| s.parse().ok()).collect();
         if ip_parts.len() != 4 {
             return Err(io::Error::other("Invalid IP address"));
         }
         let server_ip = Ipv4Address::new(ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]);
-        let server_port: u16 = parts[1].parse().map_err(|_| io::Error::other("Invalid port"))?;
+        let server_port: u16 = parts[1]
+            .parse()
+            .map_err(|_| io::Error::other("Invalid port"))?;
 
         run_udp_bandwidth_test(mac, rx_queue, tx_sender, server_ip, server_port, cancel).await
     } else {

@@ -4,7 +4,8 @@
 //! a TAP interface and relying on the host's network stack, we run smoltcp
 //! directly and perform DHCP + connectivity tests.
 
-use icd::{MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxTopic};
+use ergot::Address;
+use icd::{MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxEndpoint, WifiTxTopic};
 use log::{debug, info, warn};
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
@@ -138,7 +139,7 @@ pub async fn run_smoltcp_stack(
     let icmp_tx_buffer =
         icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 1024]);
     let mut icmp_socket = icmp::Socket::new(icmp_rx_buffer, icmp_tx_buffer);
-    
+
     // Bind to receive echo replies with our identifier (1)
     const PING_IDENT: u16 = 1;
     icmp_socket.bind(icmp::Endpoint::Ident(PING_IDENT)).unwrap();
@@ -294,7 +295,7 @@ fn smoltcp_instant() -> Instant {
 }
 
 /// Run TCP bandwidth test - connects to a server and downloads data
-/// 
+///
 /// Usage: Start a server with `dd if=/dev/zero bs=1M count=100 | nc -l -p 5000`
 /// Then run this test with the server's IP and port
 pub async fn run_tcp_bandwidth_test(
@@ -305,7 +306,10 @@ pub async fn run_tcp_bandwidth_test(
     server_port: u16,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    info!("Starting TCP bandwidth test to {}:{}", server_ip, server_port);
+    info!(
+        "Starting TCP bandwidth test to {}:{}",
+        server_ip, server_port
+    );
 
     let mtu = crate::TAP_MTU as usize;
     let mut device = ChannelDevice::new(rx_queue.clone(), tx_sender, mtu);
@@ -371,17 +375,17 @@ pub async fn run_tcp_bandwidth_test(
         // Start TCP connection once we have IP
         if got_ip && !tcp_started {
             let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            let local_port = 49152 + (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() % 16384) as u16;
-            
+            let local_port = 49152
+                + (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    % 16384) as u16;
+
             info!("Connecting to {}:{}...", server_ip, server_port);
-            if let Err(e) = tcp_socket.connect(
-                iface.context(),
-                (server_ip, server_port),
-                local_port,
-            ) {
+            if let Err(e) =
+                tcp_socket.connect(iface.context(), (server_ip, server_port), local_port)
+            {
                 warn!("TCP connect failed: {:?}", e);
             } else {
                 tcp_started = true;
@@ -390,7 +394,7 @@ pub async fn run_tcp_bandwidth_test(
 
         // Handle TCP state
         let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        
+
         if tcp_started && !tcp_connected && tcp_socket.is_active() {
             if tcp_socket.may_recv() {
                 info!("TCP connected! Starting download...");
@@ -416,11 +420,16 @@ pub async fn run_tcp_bandwidth_test(
         }
 
         // Check if connection closed
-        if tcp_connected && !tcp_socket.may_recv() && tcp_socket.state() != tcp::State::Established {
+        if tcp_connected && !tcp_socket.may_recv() && tcp_socket.state() != tcp::State::Established
+        {
             let elapsed = start_time.unwrap().elapsed();
             let mbps = (total_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
             info!("Download complete!");
-            info!("  Total: {} bytes ({:.2} MB)", total_bytes, total_bytes as f64 / 1_000_000.0);
+            info!(
+                "  Total: {} bytes ({:.2} MB)",
+                total_bytes,
+                total_bytes as f64 / 1_000_000.0
+            );
             info!("  Time: {:.2}s", elapsed.as_secs_f64());
             info!("  Throughput: {:.2} Mbps", mbps);
             break;
@@ -446,10 +455,10 @@ pub async fn run_tcp_bandwidth_test(
 }
 
 /// Run UDP bandwidth test - receives data from a UDP server
-/// 
+///
 /// Usage: Start a server that sends UDP data to the client:
 ///   Server: while true; do dd if=/dev/zero bs=1400 count=10000 2>/dev/null | nc -u <client_ip> 5001; sleep 1; done
-/// 
+///
 /// Or use iperf3:
 ///   Server: iperf3 -s
 ///   Then this test will send a trigger packet and receive data
@@ -461,7 +470,10 @@ pub async fn run_udp_bandwidth_test(
     server_port: u16,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    info!("Starting UDP bandwidth test from {}:{}", server_ip, server_port);
+    info!(
+        "Starting UDP bandwidth test from {}:{}",
+        server_ip, server_port
+    );
 
     let mtu = crate::TAP_MTU as usize;
     let mut device = ChannelDevice::new(rx_queue.clone(), tx_sender, mtu);
@@ -479,14 +491,9 @@ pub async fn run_udp_bandwidth_test(
     let dhcp_handle = sockets.add(dhcp_socket);
 
     // Add UDP socket with large buffers
-    let udp_rx_buffer = udp::PacketBuffer::new(
-        vec![udp::PacketMetadata::EMPTY; 64],
-        vec![0; 65535],
-    );
-    let udp_tx_buffer = udp::PacketBuffer::new(
-        vec![udp::PacketMetadata::EMPTY; 8],
-        vec![0; 4096],
-    );
+    let udp_rx_buffer =
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 65535]);
+    let udp_tx_buffer = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0; 4096]);
     let mut udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
     let local_port = 5001;
     udp_socket.bind(local_port).unwrap();
@@ -542,7 +549,10 @@ pub async fn run_udp_bandwidth_test(
                 if let Err(e) = udp_socket.send_slice(trigger_msg, dest) {
                     warn!("Failed to send trigger: {:?}", e);
                 } else {
-                    info!("Sent trigger packet to {}:{}, waiting for data...", server_ip, server_port);
+                    info!(
+                        "Sent trigger packet to {}:{}, waiting for data...",
+                        server_ip, server_port
+                    );
                     sent_trigger = true;
                     start_time = Some(std::time::Instant::now());
                     last_packet_time = std::time::Instant::now();
@@ -559,7 +569,7 @@ pub async fn run_udp_bandwidth_test(
                         total_bytes += data.len() as u64;
                         total_packets += 1;
                         last_packet_time = std::time::Instant::now();
-                        
+
                         if total_packets == 1 {
                             info!("Receiving UDP data...");
                         }
@@ -573,11 +583,17 @@ pub async fn run_udp_bandwidth_test(
         }
 
         // Check for timeout (no packets for 5 seconds)
-        if sent_trigger && total_packets > 0 && last_packet_time.elapsed() > Duration::from_secs(5) {
+        if sent_trigger && total_packets > 0 && last_packet_time.elapsed() > Duration::from_secs(5)
+        {
             let elapsed = start_time.unwrap().elapsed();
             let mbps = (total_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
             info!("UDP receive complete (timeout)!");
-            info!("  Total: {} bytes ({:.2} MB) in {} packets", total_bytes, total_bytes as f64 / 1_000_000.0, total_packets);
+            info!(
+                "  Total: {} bytes ({:.2} MB) in {} packets",
+                total_bytes,
+                total_bytes as f64 / 1_000_000.0,
+                total_packets
+            );
             info!("  Time: {:.2}s", elapsed.as_secs_f64());
             info!("  Throughput: {:.2} Mbps", mbps);
             break;
@@ -604,11 +620,11 @@ pub async fn run_udp_bandwidth_test(
 }
 
 /// Run HTTP download bandwidth test - connects to a server and downloads via HTTP GET
-/// 
+///
 /// Usage: Start a simple HTTP server:
 ///   python3 -m http.server 8080
 /// Or use nginx/apache serving a large file.
-/// 
+///
 /// The test will request a specific path (default: /testfile or a large file)
 pub async fn run_http_download_test(
     mac: [u8; 6],
@@ -619,7 +635,10 @@ pub async fn run_http_download_test(
     path: &str,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    info!("Starting HTTP download test: http://{}:{}{}", server_ip, server_port, path);
+    info!(
+        "Starting HTTP download test: http://{}:{}{}",
+        server_ip, server_port, path
+    );
 
     let mtu = crate::TAP_MTU as usize;
     let mut device = ChannelDevice::new(rx_queue.clone(), tx_sender, mtu);
@@ -689,17 +708,17 @@ pub async fn run_http_download_test(
         // Start TCP connection once we have IP
         if got_ip && !tcp_started {
             let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-            let local_port = 49152 + (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() % 16384) as u16;
-            
+            let local_port = 49152
+                + (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    % 16384) as u16;
+
             info!("Connecting to {}:{}...", server_ip, server_port);
-            if let Err(e) = tcp_socket.connect(
-                iface.context(),
-                (server_ip, server_port),
-                local_port,
-            ) {
+            if let Err(e) =
+                tcp_socket.connect(iface.context(), (server_ip, server_port), local_port)
+            {
                 warn!("TCP connect failed: {:?}", e);
             } else {
                 tcp_started = true;
@@ -708,18 +727,23 @@ pub async fn run_http_download_test(
 
         // Handle TCP state
         let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        
+
         // Debug: log TCP state periodically
         static mut LAST_STATE_LOG: Option<std::time::Instant> = None;
-        let should_log = unsafe {
-            LAST_STATE_LOG.map_or(true, |t| t.elapsed() > Duration::from_secs(2))
-        };
+        let should_log =
+            unsafe { LAST_STATE_LOG.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) };
         if tcp_started && !tcp_connected && should_log {
-            info!("TCP state: {:?}, can_send={}, can_recv={}", 
-                  tcp_socket.state(), tcp_socket.may_send(), tcp_socket.may_recv());
-            unsafe { LAST_STATE_LOG = Some(std::time::Instant::now()); }
+            info!(
+                "TCP state: {:?}, can_send={}, can_recv={}",
+                tcp_socket.state(),
+                tcp_socket.may_send(),
+                tcp_socket.may_recv()
+            );
+            unsafe {
+                LAST_STATE_LOG = Some(std::time::Instant::now());
+            }
         }
-        
+
         if tcp_started && !tcp_connected && tcp_socket.is_active() {
             if tcp_socket.may_recv() {
                 info!("TCP connected!");
@@ -761,7 +785,7 @@ pub async fn run_http_download_test(
                             headers_done = true;
                             let body_start = pos + 4;
                             body_bytes += (header_buf.len() - body_start) as u64;
-                            
+
                             // Print headers
                             let headers = String::from_utf8_lossy(&header_buf[..pos]);
                             info!("HTTP Response headers:\n{}", headers);
@@ -788,7 +812,11 @@ pub async fn run_http_download_test(
                 let elapsed = start_time.unwrap().elapsed();
                 let mbps = (body_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
                 info!("HTTP download complete!");
-                info!("  Body size: {} bytes ({:.2} MB)", body_bytes, body_bytes as f64 / 1_000_000.0);
+                info!(
+                    "  Body size: {} bytes ({:.2} MB)",
+                    body_bytes,
+                    body_bytes as f64 / 1_000_000.0
+                );
                 info!("  Total received: {} bytes", total_bytes);
                 info!("  Time: {:.2}s", elapsed.as_secs_f64());
                 info!("  Throughput: {:.2} Mbps", mbps);
@@ -800,7 +828,7 @@ pub async fn run_http_download_test(
         if http_request_sent && headers_done && last_report.elapsed() > Duration::from_secs(2) {
             let elapsed = start_time.unwrap().elapsed();
             let mbps = (body_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
-            
+
             // Debug: show TCP socket state
             let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
             let rx_queue_len = {
@@ -832,6 +860,7 @@ pub async fn bridge_ergot_to_smoltcp_serial(
     stack: ergot::toolkits::tokio_serial_v5::RouterStack,
     rx_queue: RxQueue,
     mut tx_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    peer: Address,
     cancel: CancellationToken,
 ) {
     info!("Starting ergot <-> smoltcp bridge (serial)");
@@ -840,16 +869,16 @@ pub async fn bridge_ergot_to_smoltcp_serial(
     let rx_cancel = cancel.clone();
     let tx_cancel = cancel.clone();
     let stack_clone = stack.clone();
-    
+
     // Shared stats
     let rx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tx_blocked_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    
+
     let rx_count_clone = rx_count.clone();
     let tx_count_clone = tx_count.clone();
     let tx_blocked_clone = tx_blocked_ms.clone();
-    
+
     // RX task: WiFi -> smoltcp
     let rx_task = tokio::spawn(async move {
         let subber = stack
@@ -857,20 +886,20 @@ pub async fn bridge_ergot_to_smoltcp_serial(
             .heap_bounded_receiver::<WifiRxTopic>(64, None);
         let subber = pin!(subber);
         let mut wifi_rx = subber.subscribe();
-        
+
         loop {
             select! {
                 msg = wifi_rx.recv() => {
                     let frame = msg.t.data.to_vec();
                     let count = rx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     log_frame("RX", count, &frame);
-                    
+
                     let queue_len = {
                         let mut q = rx_queue.lock().unwrap();
                         q.push_back(frame);
                         q.len()
                     };
-                    
+
                     if queue_len > 10 {
                         warn!("RX queue backing up: {} frames", queue_len);
                     }
@@ -882,7 +911,7 @@ pub async fn bridge_ergot_to_smoltcp_serial(
             }
         }
     });
-    
+
     // TX task: smoltcp -> WiFi
     let tx_task = tokio::spawn(async move {
         loop {
@@ -890,23 +919,23 @@ pub async fn bridge_ergot_to_smoltcp_serial(
                 Some(frame) = tx_receiver.recv() => {
                     let count = tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     log_frame("TX", count, &frame);
-                    
+
                     let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
                     if frame_data.extend_from_slice(&frame).is_ok() {
                         let wifi_frame = WifiFrame { data: frame_data };
-                        
+
                         let start = std::time::Instant::now();
                         let result = stack_clone
-                            .topics()
-                            .broadcast_wait::<WifiTxTopic>(&wifi_frame, None)
+                            .endpoints()
+                            .request::<WifiTxEndpoint>(peer, &wifi_frame, None)
                             .await;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        
+
                         if elapsed_ms > 10 {
-                            warn!("broadcast_wait took {}ms for frame #{}", elapsed_ms, count);
+                            warn!("WiFi TX request took {}ms for frame #{}", elapsed_ms, count);
                             tx_blocked_clone.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
                         }
-                        
+
                         if let Err(e) = result {
                             warn!("Failed to send to WiFi: {:?}", e);
                         }
@@ -919,7 +948,7 @@ pub async fn bridge_ergot_to_smoltcp_serial(
             }
         }
     });
-    
+
     // Stats task
     let stats_cancel = cancel.clone();
     let stats_task = tokio::spawn(async move {
@@ -938,13 +967,13 @@ pub async fn bridge_ergot_to_smoltcp_serial(
             }
         }
     });
-    
+
     // Wait for cancellation
     cancel.cancelled().await;
-    
+
     // Wait for tasks to finish
     let _ = tokio::join!(rx_task, tx_task, stats_task);
-    
+
     info!("Bridge shutdown complete");
 }
 
@@ -955,7 +984,7 @@ fn log_frame(direction: &str, count: u64, frame: &[u8]) {
     if !should_log {
         return;
     }
-    
+
     if frame.len() >= 14 {
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
 
@@ -970,7 +999,7 @@ fn log_frame(direction: &str, count: u64, frame: &[u8]) {
                 17 => "UDP",
                 _ => "other",
             };
-            
+
             // For TCP, also log flags
             let extra = if protocol == 6 && frame.len() >= 54 {
                 let ihl = (frame[14] & 0x0f) as usize * 4;
@@ -979,27 +1008,41 @@ fn log_frame(direction: &str, count: u64, frame: &[u8]) {
                     let src_port = u16::from_be_bytes([frame[tcp_start], frame[tcp_start + 1]]);
                     let dst_port = u16::from_be_bytes([frame[tcp_start + 2], frame[tcp_start + 3]]);
                     let flags = frame[tcp_start + 13];
-                    let flag_str = format!("{}{}{}{}{}",
+                    let flag_str = format!(
+                        "{}{}{}{}{}",
                         if flags & 0x02 != 0 { "SYN " } else { "" },
                         if flags & 0x10 != 0 { "ACK " } else { "" },
                         if flags & 0x01 != 0 { "FIN " } else { "" },
                         if flags & 0x04 != 0 { "RST " } else { "" },
                         if flags & 0x08 != 0 { "PSH " } else { "" },
                     );
-                    format!(" [{}:{} -> {}:{} {}]", src_port, dst_port, dst_port, src_port, flag_str.trim())
+                    format!(
+                        " [{}:{} -> {}:{} {}]",
+                        src_port,
+                        dst_port,
+                        dst_port,
+                        src_port,
+                        flag_str.trim()
+                    )
                 } else {
                     String::new()
                 }
             } else {
                 String::new()
             };
-            
+
             info!(
                 "WiFi {}: IPv4 {} {}.{}.{}.{} -> {}.{}.{}.{}{}  ({} bytes)",
                 direction,
                 proto_name,
-                src_ip[0], src_ip[1], src_ip[2], src_ip[3],
-                dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
+                src_ip[0],
+                src_ip[1],
+                src_ip[2],
+                src_ip[3],
+                dst_ip[0],
+                dst_ip[1],
+                dst_ip[2],
+                dst_ip[3],
                 extra,
                 frame.len()
             );
@@ -1008,13 +1051,18 @@ fn log_frame(direction: &str, count: u64, frame: &[u8]) {
         } else {
             debug!(
                 "WiFi {} #{}: {} bytes, ethertype=0x{:04x}",
-                direction, count, frame.len(), ethertype
+                direction,
+                count,
+                frame.len(),
+                ethertype
             );
         }
     } else {
         debug!(
             "WiFi {} #{}: {} bytes (too short)",
-            direction, count, frame.len()
+            direction,
+            count,
+            frame.len()
         );
     }
 }
@@ -1032,16 +1080,16 @@ pub async fn bridge_ergot_to_smoltcp_nusb(
     let rx_cancel = cancel.clone();
     let tx_cancel = cancel.clone();
     let stack_clone = stack.clone();
-    
+
     // Shared stats
     let rx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tx_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tx_blocked_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    
+
     let rx_count_clone = rx_count.clone();
     let tx_count_clone = tx_count.clone();
     let tx_blocked_clone = tx_blocked_ms.clone();
-    
+
     // RX task: WiFi -> smoltcp
     let rx_task = tokio::spawn(async move {
         let subber = stack
@@ -1049,20 +1097,20 @@ pub async fn bridge_ergot_to_smoltcp_nusb(
             .heap_bounded_receiver::<WifiRxTopic>(64, None);
         let subber = pin!(subber);
         let mut wifi_rx = subber.subscribe();
-        
+
         loop {
             select! {
                 msg = wifi_rx.recv() => {
                     let frame = msg.t.data.to_vec();
                     let count = rx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     log_frame("RX", count, &frame);
-                    
+
                     let queue_len = {
                         let mut q = rx_queue.lock().unwrap();
                         q.push_back(frame);
                         q.len()
                     };
-                    
+
                     if queue_len > 10 {
                         warn!("RX queue backing up: {} frames", queue_len);
                     }
@@ -1074,7 +1122,7 @@ pub async fn bridge_ergot_to_smoltcp_nusb(
             }
         }
     });
-    
+
     // TX task: smoltcp -> WiFi
     let tx_task = tokio::spawn(async move {
         loop {
@@ -1082,23 +1130,22 @@ pub async fn bridge_ergot_to_smoltcp_nusb(
                 Some(frame) = tx_receiver.recv() => {
                     let count = tx_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     log_frame("TX", count, &frame);
-                    
+
                     let mut frame_data = heapless::Vec::<u8, MAX_FRAME_SIZE>::new();
                     if frame_data.extend_from_slice(&frame).is_ok() {
                         let wifi_frame = WifiFrame { data: frame_data };
-                        
+
                         let start = std::time::Instant::now();
                         let result = stack_clone
                             .topics()
-                            .broadcast_wait::<WifiTxTopic>(&wifi_frame, None)
-                            .await;
+                            .broadcast::<WifiTxTopic>(&wifi_frame, None);
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        
+
                         if elapsed_ms > 10 {
-                            warn!("broadcast_wait took {}ms for frame #{}", elapsed_ms, count);
+                            warn!("WiFi broadcast took {}ms for frame #{}", elapsed_ms, count);
                             tx_blocked_clone.fetch_add(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
                         }
-                        
+
                         if let Err(e) = result {
                             warn!("Failed to send to WiFi: {:?}", e);
                         }
@@ -1111,7 +1158,7 @@ pub async fn bridge_ergot_to_smoltcp_nusb(
             }
         }
     });
-    
+
     // Stats task
     let stats_cancel = cancel.clone();
     let stats_task = tokio::spawn(async move {
@@ -1130,12 +1177,12 @@ pub async fn bridge_ergot_to_smoltcp_nusb(
             }
         }
     });
-    
+
     // Wait for cancellation
     cancel.cancelled().await;
-    
+
     // Wait for tasks to finish
     let _ = tokio::join!(rx_task, tx_task, stats_task);
-    
+
     info!("Bridge shutdown complete");
 }

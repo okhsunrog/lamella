@@ -20,7 +20,7 @@ use crate::{ESP32_NODE_ID, MAC_QUERY_RETRIES, MAC_QUERY_RETRY_DELAY_MS, MAC_QUER
 /// Query MAC address with retries (NUSB transport)
 pub async fn query_mac_with_retry_nusb(
     stack: &NusbRouterStack,
-    interface_id: u64,
+    interface_id: u8,
 ) -> io::Result<[u8; 6]> {
     let mut last_err: Option<io::Error> = None;
     for attempt in 1..=MAC_QUERY_RETRIES {
@@ -54,7 +54,7 @@ pub async fn query_mac_with_retry_nusb(
 /// Query MAC address with retries (Serial transport)
 pub async fn query_mac_with_retry_serial(
     stack: &SerialRouterStack,
-    interface_id: u64,
+    interface_id: u8,
 ) -> io::Result<[u8; 6]> {
     let mut last_err: Option<io::Error> = None;
     for attempt in 1..=MAC_QUERY_RETRIES {
@@ -85,9 +85,26 @@ pub async fn query_mac_with_retry_serial(
     Err(last_err.unwrap_or_else(|| io::Error::other("Failed to query ESP32 MAC")))
 }
 
+/// Resolve the ESP32 peer address for an active serial interface.
+pub fn serial_peer_address(stack: &SerialRouterStack, interface_id: u8) -> io::Result<Address> {
+    let net_id = stack
+        .manage_profile(|im| im.interface_state(interface_id))
+        .and_then(|state| match state {
+            InterfaceState::Active { net_id, node_id: _ } => Some(net_id),
+            _ => None,
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No active interface"))?;
+
+    Ok(Address {
+        network_id: net_id,
+        node_id: ESP32_NODE_ID,
+        port_id: 0,
+    })
+}
+
 async fn query_mac_for_interface_nusb(
     stack: &NusbRouterStack,
-    interface_id: u64,
+    interface_id: u8,
 ) -> io::Result<[u8; 6]> {
     let net_id = stack
         .manage_profile(|im| im.interface_state(interface_id))
@@ -112,21 +129,9 @@ async fn query_mac_for_interface_nusb(
 
 async fn query_mac_for_interface_serial(
     stack: &SerialRouterStack,
-    interface_id: u64,
+    interface_id: u8,
 ) -> io::Result<[u8; 6]> {
-    let net_id = stack
-        .manage_profile(|im| im.interface_state(interface_id))
-        .and_then(|state| match state {
-            InterfaceState::Active { net_id, node_id: _ } => Some(net_id),
-            _ => None,
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No active interface"))?;
-
-    let addr = Address {
-        network_id: net_id,
-        node_id: ESP32_NODE_ID,
-        port_id: 0,
-    };
+    let addr = serial_peer_address(stack, interface_id)?;
 
     stack
         .endpoints()
