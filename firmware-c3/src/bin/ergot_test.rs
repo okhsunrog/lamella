@@ -117,27 +117,17 @@ async fn run_tx(mut tx: UsbSerialJtagTx<'static, Async>) {
     loop {
         let data = rx.wait_read().await;
         let len = data.len();
-        match Write::write(&mut tx, &data).await {
-            Ok(0) => {
-                data.release(0);
-                warn!("Serial TX wrote zero bytes");
-            }
-            Ok(used) => {
-                data.release(used);
-                // End an exact-64-byte USB transfer with an empty COBS frame.
-                // The empty frame is ignored by the receiver and gives the
-                // host a short packet to complete its read.
-                if used.is_multiple_of(64) {
-                    match Write::write(&mut tx, &[0]).await {
-                        Ok(1) => {}
-                        Ok(_) => warn!("Serial TX padding write was incomplete"),
-                        Err(_) => warn!("Serial TX padding write failed"),
-                    }
-                }
-            }
+        let result = async {
+            Write::write_all(&mut tx, &data).await?;
+            Write::flush(&mut tx).await
+        }
+        .await;
+
+        match result {
+            Ok(()) => data.release(len),
             Err(_) => {
-                warn!("Serial TX error");
                 data.release(len);
+                warn!("Serial TX write or flush error");
             }
         }
 

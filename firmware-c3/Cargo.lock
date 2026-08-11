@@ -958,7 +958,7 @@ dependencies = [
 [[package]]
 name = "esp-alloc"
 version = "0.10.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "allocator-api2",
  "defmt 1.1.1",
@@ -974,7 +974,7 @@ dependencies = [
 [[package]]
 name = "esp-bootloader-esp-idf"
 version = "0.5.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "defmt 1.1.1",
  "document-features",
@@ -991,7 +991,7 @@ dependencies = [
 [[package]]
 name = "esp-config"
 version = "0.7.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "document-features",
  "esp-metadata-generated",
@@ -1003,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "esp-hal"
 version = "1.1.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "bitfield 0.19.4",
  "bytemuck",
@@ -1060,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "esp-hal-procmacros"
 version = "0.22.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "document-features",
  "proc-macro-crate",
@@ -1073,12 +1073,12 @@ dependencies = [
 [[package]]
 name = "esp-metadata-generated"
 version = "0.4.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 
 [[package]]
 name = "esp-phy"
 version = "0.2.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "defmt 1.1.1",
  "document-features",
@@ -1094,7 +1094,7 @@ dependencies = [
 [[package]]
 name = "esp-radio"
 version = "1.0.0-beta.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "allocator-api2",
  "bt-hci",
@@ -1138,7 +1138,7 @@ dependencies = [
 [[package]]
 name = "esp-radio-rtos-driver"
 version = "0.3.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "esp-sync",
  "portable-atomic",
@@ -1147,7 +1147,7 @@ dependencies = [
 [[package]]
 name = "esp-riscv-rt"
 version = "0.14.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "defmt 1.1.1",
  "document-features",
@@ -1158,7 +1158,7 @@ dependencies = [
 [[package]]
 name = "esp-rom-sys"
 version = "0.1.4"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "document-features",
  "esp-metadata-generated",
@@ -1168,7 +1168,7 @@ dependencies = [
 [[package]]
 name = "esp-rtos"
 version = "0.3.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "allocator-api2",
  "defmt 1.1.1",
@@ -1193,7 +1193,7 @@ dependencies = [
 [[package]]
 name = "esp-storage"
 version = "0.9.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "document-features",
  "esp-hal",
@@ -1207,7 +1207,7 @@ dependencies = [
 [[package]]
 name = "esp-sync"
 version = "0.2.1"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "defmt 1.1.1",
  "document-features",
@@ -2771,7 +2771,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx"
 version = "0.13.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "critical-section",
 ]
@@ -2779,7 +2779,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx-rt"
 version = "0.22.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "defmt 1.1.1",
  "document-features",
@@ -2790,7 +2790,7 @@ dependencies = [
 [[package]]
 name = "xtensa-lx-rt-proc-macros"
 version = "0.5.0"
-source = "git+https://github.com/esp-rs/esp-hal?rev=6713fbd7391691098d7229d9950c8391f1b50a94#6713fbd7391691098d7229d9950c8391f1b50a94"
+source = "git+https://github.com/okhsunrog/esp-hal?rev=3a9d8b1ecbcc470e2ce55e494b587f29e985edff#3a9d8b1ecbcc470e2ce55e494b587f29e985edff"
 dependencies = [
  "proc-macro2",
  "quote",
