@@ -20,7 +20,7 @@ Lamella lets a host device use an ESP32's WiFi through a TAP interface. The ESP3
 Transport-agnostic design. Currently supported: USB, Serial.
 
 - **firmware-s3** — ESP32-S3 firmware (tested, works)
-- **firmware-c3** — ESP32-C3 firmware (WIP, buggy)
+- **firmware-c3** — ESP32-C3 firmware (tested, works)
 - **host** — daemon that creates a TAP interface and bridges traffic
 - **icd** — shared protocol definitions (Interface Control Document)
 
