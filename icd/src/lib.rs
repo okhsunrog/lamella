@@ -48,14 +48,10 @@ pub struct WifiRxResponse {
 // sent only after the driver has accepted the frame for transmission.
 endpoint!(WifiTxEndpoint, WifiTxRequest, WifiTxResponse, "wifi/tx");
 
-// Short-poll one frame received by the ESP32-C3 WiFi driver. The host
-// serializes this with WifiTxEndpoint requests so only one request is ever in
-// flight on the USB stream.
+// Short-poll one frame received by the ESP32 WiFi driver. The host serializes
+// this with WifiTxEndpoint requests so only one request is ever in flight on
+// the USB transport.
 endpoint!(WifiRxEndpoint, WifiRxRequest, WifiRxResponse, "wifi/rx");
-
-// Legacy best-effort paths used by the ESP32-S3 firmware.
-topic!(WifiRxTopic, WifiFrame, "wifi/rx");
-topic!(WifiTxTopic, WifiFrame, "wifi/tx");
 
 // Ping topic for testing
 topic!(PingTopic, u64, "ping/data");

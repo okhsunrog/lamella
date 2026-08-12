@@ -102,10 +102,8 @@ pub fn serial_peer_address(stack: &SerialRouterStack, interface_id: u8) -> io::R
     })
 }
 
-async fn query_mac_for_interface_nusb(
-    stack: &NusbRouterStack,
-    interface_id: u8,
-) -> io::Result<[u8; 6]> {
+/// Resolve the ESP32 peer address for an active USB interface.
+pub fn nusb_peer_address(stack: &NusbRouterStack, interface_id: u8) -> io::Result<Address> {
     let net_id = stack
         .manage_profile(|im| im.interface_state(interface_id))
         .and_then(|state| match state {
@@ -114,11 +112,18 @@ async fn query_mac_for_interface_nusb(
         })
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No active interface"))?;
 
-    let addr = Address {
+    Ok(Address {
         network_id: net_id,
         node_id: ESP32_NODE_ID,
         port_id: 0,
-    };
+    })
+}
+
+async fn query_mac_for_interface_nusb(
+    stack: &NusbRouterStack,
+    interface_id: u8,
+) -> io::Result<[u8; 6]> {
+    let addr = nusb_peer_address(stack, interface_id)?;
 
     stack
         .endpoints()

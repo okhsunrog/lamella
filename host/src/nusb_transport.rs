@@ -1,13 +1,21 @@
 //! NUSB transport for ESP32-S3 with USB OTG
 
 use ergot::{
+    Address,
     interface_manager::interface_impls::nusb_bulk::DeviceInfo as ErgotDeviceInfo,
     toolkits::nusb_v0_1::{RouterStack, find_new_devices, register_router_interface},
 };
-use icd::{MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxTopic, WifiTxTopic};
+use icd::{
+    MAX_FRAME_SIZE, PingTopic, WifiFrame, WifiRxEndpoint, WifiRxRequest, WifiTransaction,
+    WifiTxEndpoint, WifiTxRequest,
+};
 use log::{error, info, trace, warn};
 use std::{collections::HashSet, io, pin::pin, sync::Arc, time::Duration};
-use tokio::{select, time::sleep};
+use tokio::{
+    select,
+    sync::{mpsc, watch},
+    time::sleep,
+};
 use tokio_util::sync::CancellationToken;
 use tun_rs::AsyncDevice;
 
@@ -15,6 +23,7 @@ use crate::{bridge, create_tap_interface, log_mac};
 
 const MTU: u16 = 2048;
 const OUT_BUFFER_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
+const REQUEST_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub async fn run(cancel: CancellationToken) -> io::Result<()> {
     let stack: RouterStack = RouterStack::new();
@@ -52,21 +61,23 @@ pub async fn run(cancel: CancellationToken) -> io::Result<()> {
         }
     };
 
+    let peer = bridge::nusb_peer_address(&stack, interface_id)?;
     log_mac(&expected_mac);
 
     // Create TAP interface with ESP32's WiFi MAC
     let tap_device = create_tap_interface(&expected_mac)?;
 
-    // Spawn bridge tasks with cancellation support
+    // A reader queues TAP frames while one exchange task exclusively owns the
+    // Ergot request path.
+    let (tap_tx, tap_rx) = mpsc::channel(1);
+    let (peer_tx, peer_rx) = watch::channel(peer);
     let ping_handle = tokio::spawn(ping_listener(stack.clone(), cancel.clone()));
-    let tap_to_wifi_handle = tokio::spawn(tap_to_wifi(
+    let tap_reader_handle = tokio::spawn(tap_reader(tap_device.clone(), tap_tx, cancel.clone()));
+    let exchange_handle = tokio::spawn(wifi_exchange(
         stack.clone(),
-        tap_device.clone(),
-        cancel.clone(),
-    ));
-    let wifi_to_tap_handle = tokio::spawn(wifi_to_tap(
-        stack.clone(),
-        tap_device.clone(),
+        tap_device,
+        peer_rx,
+        tap_rx,
         cancel.clone(),
     ));
 
@@ -95,6 +106,18 @@ pub async fn run(cancel: CancellationToken) -> io::Result<()> {
                                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
                                 );
                             }
+                            match bridge::nusb_peer_address(&stack, iface) {
+                                Ok(peer) => {
+                                    peer_tx.send_replace(peer);
+                                    info!("Updated ESP32 route after reconnect");
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "Failed to resolve ESP32 route after reconnect: {:?}",
+                                        err
+                                    );
+                                }
+                            }
                         }
                         Err(err) => {
                             warn!(
@@ -110,7 +133,7 @@ pub async fn run(cancel: CancellationToken) -> io::Result<()> {
     }
 
     // Wait for bridge tasks to finish
-    let _ = tokio::join!(ping_handle, tap_to_wifi_handle, wifi_to_tap_handle);
+    let _ = tokio::join!(ping_handle, tap_reader_handle, exchange_handle);
     info!("NUSB transport shut down complete");
 
     Ok(())
@@ -195,9 +218,14 @@ async fn ping_listener(stack: RouterStack, cancel: CancellationToken) {
     }
 }
 
-/// Forward frames from TAP interface to ESP32-S3 via WiFi
-async fn tap_to_wifi(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: CancellationToken) {
-    info!("TAP to WiFi forwarder started");
+/// Read frames from TAP into a small bounded queue. The queue preserves
+/// backpressure while the exchange task waits for the radio acknowledgement.
+async fn tap_reader(
+    tap_device: Arc<AsyncDevice>,
+    tx: mpsc::Sender<WifiFrame>,
+    cancel: CancellationToken,
+) {
+    info!("TAP reader started");
 
     let mut buf = [0u8; MAX_FRAME_SIZE];
 
@@ -222,44 +250,121 @@ async fn tap_to_wifi(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: C
                     }
                 };
 
-                if let Err(e) = stack
-                    .topics()
-                    .broadcast::<WifiTxTopic>(&frame, None)
-                {
-                    warn!("WiFi broadcast failed: {:?}", e);
+                select! {
+                    result = tx.send(frame) => {
+                        if result.is_err() {
+                            warn!("WiFi exchange queue closed");
+                            break;
+                        }
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("TAP reader shutting down");
+                        break;
+                    }
                 }
             }
             _ = cancel.cancelled() => {
-                info!("TAP to WiFi forwarder shutting down");
+                info!("TAP reader shutting down");
                 break;
             }
         }
     }
 }
 
-/// Forward frames from ESP32-S3 WiFi to TAP interface
-async fn wifi_to_tap(stack: RouterStack, tap_device: Arc<AsyncDevice>, cancel: CancellationToken) {
-    info!("WiFi to TAP forwarder started");
-
-    let subber = stack
-        .topics()
-        .heap_bounded_receiver::<WifiRxTopic>(64, None);
-    let subber = pin!(subber);
-    let mut hdl = subber.subscribe();
+/// Serialize TX requests and short RX polls through one request owner.
+async fn wifi_exchange(
+    stack: RouterStack,
+    tap_device: Arc<AsyncDevice>,
+    mut peer: watch::Receiver<Address>,
+    mut tap_rx: mpsc::Receiver<WifiFrame>,
+    cancel: CancellationToken,
+) {
+    info!("WiFi exchange task started");
+    let session = nusb_session_id();
+    let mut next_transaction_id = 0u32;
 
     loop {
-        select! {
-            msg = hdl.recv() => {
-                if let Err(e) = tap_device.send(&msg.t.data).await {
-                    error!("TAP write error: {:?}", e);
+        if let Ok(frame) = tap_rx.try_recv() {
+            let transaction = WifiTransaction {
+                session,
+                id: next_transaction_id,
+            };
+            next_transaction_id = next_transaction_id.wrapping_add(1);
+            let request = WifiTxRequest { transaction, frame };
+
+            loop {
+                let peer = *peer.borrow_and_update();
+                let response = stack
+                    .endpoints()
+                    .request::<WifiTxEndpoint>(peer, &request, None);
+                select! {
+                    result = response => match result {
+                        Ok(response) if response.transaction == transaction => break,
+                        Ok(response) => warn!(
+                            "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
+                            transaction, response.transaction
+                        ),
+                        Err(e) => warn!("WiFi TX request failed: {:?}", e),
+                    },
+                    _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                        warn!("WiFi TX response timed out; retrying transaction {:?}", transaction);
+                    }
+                    _ = cancel.cancelled() => {
+                        info!("WiFi exchange task shutting down");
+                        return;
+                    }
                 }
             }
-            _ = cancel.cancelled() => {
-                info!("WiFi to TAP forwarder shutting down");
-                break;
+        }
+
+        let transaction = WifiTransaction {
+            session,
+            id: next_transaction_id,
+        };
+        next_transaction_id = next_transaction_id.wrapping_add(1);
+        let request = WifiRxRequest { transaction };
+
+        loop {
+            let peer = *peer.borrow_and_update();
+            let response = stack
+                .endpoints()
+                .request::<WifiRxEndpoint>(peer, &request, None);
+            select! {
+                result = response => match result {
+                    Ok(response) if response.transaction == transaction => {
+                        if let Some(frame) = response.frame
+                            && let Err(e) = tap_device.send(&frame.data).await
+                        {
+                            error!("TAP write error: {:?}", e);
+                        }
+                        break;
+                    }
+                    Ok(response) => warn!(
+                        "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
+                        transaction, response.transaction
+                    ),
+                    Err(e) => warn!("WiFi RX request failed: {:?}", e),
+                },
+                _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                    warn!("WiFi RX response timed out; retrying transaction {:?}", transaction);
+                }
+                _ = cancel.cancelled() => {
+                    info!("WiFi exchange task shutting down");
+                    return;
+                }
             }
         }
     }
+}
+
+fn nusb_session_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    now ^ u64::from(std::process::id()).rotate_left(32)
 }
 
 // ============================================================================
@@ -314,6 +419,7 @@ pub async fn run_test_mode(
         }
     };
 
+    let peer = bridge::nusb_peer_address(&stack, interface_id)?;
     crate::log_mac(&mac);
     info!("Interface ID: {}", interface_id);
 
@@ -326,8 +432,14 @@ pub async fn run_test_mode(
     let bridge_stack = stack.clone();
     let bridge_rx_queue = rx_queue.clone();
     tokio::spawn(async move {
-        bridge_ergot_to_smoltcp_nusb(bridge_stack, bridge_rx_queue, tx_receiver, bridge_cancel)
-            .await;
+        bridge_ergot_to_smoltcp_nusb(
+            bridge_stack,
+            bridge_rx_queue,
+            tx_receiver,
+            peer,
+            bridge_cancel,
+        )
+        .await;
     });
 
     // Spawn ping listener for debugging

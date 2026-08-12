@@ -33,6 +33,7 @@ esp-backtrace = { git = "https://github.com/esp-rs/esp-hal", rev = "f05b3976f8f5
 esp-println = { git = "https://github.com/esp-rs/esp-hal", rev = "f05b3976f8f5c3aa31ede23ca09bdb9d8f2f925b", features = ["esp32s3", "log-04"] }
 
 embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-sync = "0.8.0"
 embassy-time = { version = "0.5.1", features = ["log"] }
 embassy-usb = { version = "0.6.0", default-features = false }
 embassy-futures = "0.1"

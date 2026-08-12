@@ -15,10 +15,14 @@ use core::{
 use embassy_executor::{Spawner, task};
 use embassy_futures::select::{Either, select};
 use embassy_net_driver::Driver as NetDriver;
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex as CsMutex,
+    channel::{Channel, TrySendError},
+};
 use embassy_time::{Duration, Timer};
 use embassy_usb::{UsbDevice, driver::Driver as UsbDriver};
 use ergot::{
-    NetStackSendError,
+    DEFAULT_TTL, FrameKind, Header, NetStackSendError,
     exports::bbqueue::{prod_cons::framed::FramedConsumer, traits::coordination::cs::CsCoord},
     interface_manager::{
         InterfaceSendError, InterfaceState, Profile, profiles::direct_edge::EdgeFrameProcessor,
@@ -40,8 +44,11 @@ use esp_radio::wifi::{
     sta::StationConfig,
 };
 use heapless::Vec as HVec;
-use icd::{GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxTopic, WifiTxTopic};
-use log::info;
+use icd::{
+    GetMacEndpoint, MAX_FRAME_SIZE, WifiFrame, WifiRxEndpoint, WifiRxResponse, WifiTransaction,
+    WifiTxEndpoint, WifiTxResponse,
+};
+use log::{info, warn};
 use mutex::raw_impls::cs::CriticalSectionRawMutex;
 use static_cell::{ConstStaticCell, StaticCell};
 
@@ -72,6 +79,9 @@ static STACK: Stack = kit::new_target_stack(OUTQ.framed_producer(), MAX_PACKET_S
 static STORAGE: kit::WireStorage<256, 256, 64, 256> = kit::WireStorage::new();
 /// WiFi connection state (set by wifi_connection task)
 static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
+static WIFI_TO_HOST_CHANNEL: Channel<CsMutex, WifiFrame, 64> = Channel::new();
+static HOST_TO_WIFI_CHANNEL: Channel<CsMutex, WifiFrame, 1> = Channel::new();
+static WIFI_TX_COMPLETE_CHANNEL: Channel<CsMutex, (), 1> = Channel::new();
 
 fn usb_config(serial: &'static str) -> embassy_usb::Config<'static> {
     let mut config = embassy_usb::Config::new(0x16c0, 0x27DD);
@@ -166,6 +176,8 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(pingserver().unwrap());
     spawner.spawn(wifi_connection(wifi_controller).unwrap());
     spawner.spawn(mac_server(wifi_mac).unwrap());
+    spawner.spawn(wifi_tx_server().unwrap());
+    spawner.spawn(wifi_rx_server().unwrap());
     spawner.spawn(wifi_bridge(wifi_interface).unwrap());
 
     // Keep main task alive
@@ -217,6 +229,108 @@ async fn mac_server(mac: [u8; 6]) {
     }
 }
 
+/// Receive one host frame at a time and acknowledge it only after the WiFi
+/// bridge has handed it to the radio driver's TX queue.
+#[task]
+async fn wifi_tx_server() {
+    let socket = STACK.endpoints().bounded_server::<WifiTxEndpoint, 1>(None);
+    let socket = pin!(socket);
+    let mut hdl = socket.attach();
+    let mut last_completed: Option<WifiTransaction> = None;
+
+    loop {
+        let request = match hdl.recv_manual().await {
+            Ok(request) => request,
+            Err(err) => {
+                warn!("WiFi TX endpoint receive error: {:?}", err.t);
+                continue;
+            }
+        };
+        let mut src = request.hdr.dst;
+        src.port_id = hdl.port();
+        let response_header = Header {
+            src,
+            dst: request.hdr.src,
+            any_all: None,
+            seq_no: Some(request.hdr.seq_no),
+            kind: FrameKind::ENDPOINT_RESP,
+            ttl: DEFAULT_TTL,
+        };
+
+        let transaction = request.t.transaction;
+        if last_completed != Some(transaction) {
+            HOST_TO_WIFI_CHANNEL.send(request.t.frame).await;
+            WIFI_TX_COMPLETE_CHANNEL.receive().await;
+            last_completed = Some(transaction);
+        }
+        send_tx_response(&response_header, &WifiTxResponse { transaction }).await;
+    }
+}
+
+/// Retry the endpoint response if the USB output queue is temporarily full.
+async fn send_tx_response(header: &Header, response: &WifiTxResponse) {
+    loop {
+        match STACK.send_ty(header, response) {
+            Ok(()) => return,
+            Err(NetStackSendError::InterfaceSend(InterfaceSendError::InterfaceFull)) => {
+                let grant = OUTQ
+                    .framed_producer()
+                    .wait_grant(MAX_PACKET_SIZE as u16)
+                    .await;
+                drop(grant);
+            }
+            Err(err) => {
+                warn!("WiFi TX response failed: {:?}", err);
+                return;
+            }
+        }
+    }
+}
+
+/// Short-poll a WiFi RX frame for the host. Duplicate transactions return the
+/// cached response so a timed-out host request cannot consume a second frame.
+#[task]
+async fn wifi_rx_server() {
+    let socket = STACK.endpoints().bounded_server::<WifiRxEndpoint, 1>(None);
+    let socket = pin!(socket);
+    let mut hdl = socket.attach();
+    let mut cached_response: Option<WifiRxResponse> = None;
+
+    loop {
+        if let Err(err) = hdl
+            .serve(async |req| {
+                if let Some(response) = cached_response.as_ref()
+                    && response.transaction == req.transaction
+                {
+                    return response.clone();
+                }
+
+                let frame = match WIFI_TO_HOST_CHANNEL.try_receive() {
+                    Ok(frame) => Some(frame),
+                    Err(_) => match select(
+                        WIFI_TO_HOST_CHANNEL.receive(),
+                        Timer::after(Duration::from_millis(2)),
+                    )
+                    .await
+                    {
+                        Either::First(frame) => Some(frame),
+                        Either::Second(()) => None,
+                    },
+                };
+                let response = WifiRxResponse {
+                    transaction: req.transaction,
+                    frame,
+                };
+                cached_response = Some(response.clone());
+                response
+            })
+            .await
+        {
+            warn!("WiFi RX endpoint error: {:?}", err);
+        }
+    }
+}
+
 #[task]
 async fn wifi_connection(mut controller: WifiController<'static>) {
     info!("WiFi connection task started");
@@ -241,12 +355,93 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
     }
 }
 
-/// Send a frame from host to WiFi
-fn send_to_wifi(wifi_device: &mut WifiInterface, data: &[u8]) {
-    if let Some(tx_token) = wifi_device.transmit() {
-        tx_token.consume_token(data.len(), |buffer| {
-            buffer.copy_from_slice(data);
-        });
+/// Wait until the radio driver accepts one host frame.
+async fn transmit_only_to_wifi(wifi_device: &mut WifiInterface, frame: &WifiFrame) {
+    poll_fn(|cx| {
+        if let Some(tx_token) = NetDriver::transmit(wifi_device, cx) {
+            tx_token.consume_token(frame.data.len(), |buffer| {
+                buffer.copy_from_slice(&frame.data);
+            });
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// Wait for a real WiFi TX token while draining radio RX. If the host-facing
+/// queue fills, retain one frame locally and prioritize completing TX so the
+/// host can resume pulling RX frames.
+async fn transmit_to_wifi(
+    wifi_device: &mut WifiInterface,
+    tx_frame: &WifiFrame,
+) -> (u32, Option<WifiFrame>) {
+    let mut received_while_waiting = 0;
+
+    loop {
+        let mut received_frame = None;
+        let transmitted = poll_fn(|cx| {
+            if let Some(tx_token) = NetDriver::transmit(wifi_device, cx) {
+                tx_token.consume_token(tx_frame.data.len(), |buffer| {
+                    buffer.copy_from_slice(&tx_frame.data);
+                });
+                return Poll::Ready(true);
+            }
+
+            if let Some((rx_token, _tx_token)) = NetDriver::receive(wifi_device, cx) {
+                rx_token.consume_token(|buffer| {
+                    let mut frame_data = HVec::<u8, MAX_FRAME_SIZE>::new();
+                    if frame_data.extend_from_slice(buffer).is_ok() {
+                        received_frame = Some(WifiFrame { data: frame_data });
+                    }
+                });
+                return Poll::Ready(false);
+            }
+
+            Poll::Pending
+        })
+        .await;
+
+        if transmitted {
+            return (received_while_waiting, None);
+        }
+
+        if let Some(frame) = received_frame {
+            received_while_waiting += 1;
+            match WIFI_TO_HOST_CHANNEL.try_send(frame) {
+                Ok(()) => {}
+                Err(TrySendError::Full(frame)) => {
+                    transmit_only_to_wifi(wifi_device, tx_frame).await;
+                    return (received_while_waiting, Some(frame));
+                }
+            }
+        }
+    }
+}
+
+/// Queue a received WiFi frame without blocking reverse-direction progress.
+async fn queue_wifi_frame_while_serving_tx(
+    wifi_device: &mut WifiInterface,
+    mut frame: WifiFrame,
+) -> u32 {
+    let mut host_frames_transmitted = 0;
+
+    loop {
+        match WIFI_TO_HOST_CHANNEL.try_send(frame) {
+            Ok(()) => return host_frames_transmitted,
+            Err(TrySendError::Full(returned)) => frame = returned,
+        }
+
+        let ready_to_send = poll_fn(|cx| WIFI_TO_HOST_CHANNEL.poll_ready_to_send(cx));
+        match select(ready_to_send, HOST_TO_WIFI_CHANNEL.receive()).await {
+            Either::First(()) => {}
+            Either::Second(host_frame) => {
+                transmit_only_to_wifi(wifi_device, &host_frame).await;
+                host_frames_transmitted += 1;
+                WIFI_TX_COMPLETE_CHANNEL.send(()).await;
+            }
+        }
     }
 }
 
@@ -277,27 +472,20 @@ async fn wifi_bridge(mut wifi_device: WifiInterface) {
     }
     info!("Ergot connection established, starting bidirectional frame bridge");
 
-    // Subscribe to frames from host
-    let subber = STACK.topics().bounded_receiver::<WifiTxTopic, 16>(None);
-    let subber = pin!(subber);
-    let mut host_rx = subber.subscribe();
-
-    // NOTE ON BACKPRESSURE STRATEGY:
-    // Current approach: Pull WiFi frames immediately, then retry broadcast after waiting
-    // for output queue space. This buffers frames in our memory while waiting.
-    //
-    // Alternative approach: Wait for output queue space BEFORE pulling WiFi frames:
-    //   OUTQ.framed_producer().wait_grant(MAX_PACKET_SIZE as u16).await;
-    // This would apply backpressure at the WiFi driver level instead, potentially letting
-    // the WiFi hardware handle buffering/retries. This is more conservative but may reduce
-    // throughput slightly.
-    //
-    // In testing, both approaches show similar packet loss (~0.05-0.1%) and throughput.
-    // The current approach has slightly better latency. If WiFi->Host packet loss becomes
-    // an issue under heavy load, consider adding the wait_grant() call above the
-    // main select to apply earlier backpressure.
+    let mut wifi_rx_count: u32 = 0;
+    let mut host_rx_count: u32 = 0;
+    let mut wifi_tx_ok: u32 = 0;
+    let mut last_stats = embassy_time::Instant::now();
 
     loop {
+        if last_stats.elapsed() > Duration::from_secs(5) {
+            info!(
+                "Bridge stats: wifi_rx={} host_rx={} wifi_tx_ok={}",
+                wifi_rx_count, host_rx_count, wifi_tx_ok
+            );
+            last_stats = embassy_time::Instant::now();
+        }
+
         // Wait for either a WiFi frame or a host frame
         let wifi_rx_fut = poll_fn(|cx| {
             if let Some((rx_token, _tx_token)) = NetDriver::receive(&mut wifi_device, cx) {
@@ -307,8 +495,23 @@ async fn wifi_bridge(mut wifi_device: WifiInterface) {
             }
         });
 
-        match select(wifi_rx_fut, host_rx.recv()).await {
-            Either::First(rx_token) => {
+        match select(HOST_TO_WIFI_CHANNEL.receive(), wifi_rx_fut).await {
+            Either::First(frame) => {
+                host_rx_count += 1;
+                let (received, pending_rx) = transmit_to_wifi(&mut wifi_device, &frame).await;
+                wifi_rx_count += received;
+                wifi_tx_ok += 1;
+                WIFI_TX_COMPLETE_CHANNEL.send(()).await;
+
+                if let Some(frame) = pending_rx {
+                    let transmitted =
+                        queue_wifi_frame_while_serving_tx(&mut wifi_device, frame).await;
+                    host_rx_count += transmitted;
+                    wifi_tx_ok += transmitted;
+                }
+            }
+            Either::Second(rx_token) => {
+                wifi_rx_count += 1;
                 // WiFi -> Host: consume the frame and forward to ergot
                 let mut frame_opt = None;
                 rx_token.consume_token(|buffer| {
@@ -319,42 +522,11 @@ async fn wifi_bridge(mut wifi_device: WifiInterface) {
                 });
 
                 if let Some(frame) = frame_opt {
-                    // Retry broadcast with select to handle backpressure while
-                    // still processing host->wifi frames
-                    loop {
-                        let broadcast_fut = async {
-                            loop {
-                                match STACK.topics().broadcast::<WifiRxTopic>(&frame, None) {
-                                    Ok(()) => break,
-                                    Err(NetStackSendError::InterfaceSend(
-                                        InterfaceSendError::InterfaceFull,
-                                    )) => {
-                                        let grant = OUTQ
-                                            .framed_producer()
-                                            .wait_grant(MAX_PACKET_SIZE as u16)
-                                            .await;
-                                        drop(grant);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Failed to broadcast WiFi frame: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-                        match select(broadcast_fut, host_rx.recv()).await {
-                            Either::First(()) => break,
-                            Either::Second(msg) => {
-                                // Handle host->wifi while waiting for broadcast
-                                send_to_wifi(&mut wifi_device, &msg.t.data);
-                            }
-                        }
-                    }
+                    let transmitted =
+                        queue_wifi_frame_while_serving_tx(&mut wifi_device, frame).await;
+                    host_rx_count += transmitted;
+                    wifi_tx_ok += transmitted;
                 }
-            }
-            Either::Second(msg) => {
-                // Host -> WiFi: forward frame to WiFi
-                send_to_wifi(&mut wifi_device, &msg.t.data);
             }
         }
     }
