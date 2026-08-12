@@ -19,7 +19,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes libudev-dev
 
       - name: Install Rust 1.95
-        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt,rust-src
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt,rust-src
+          rustup +1.95.0 target add riscv32imc-unknown-none-elf
 
       - name: Check host formatting
         run: cargo +1.95.0 fmt --all -- --check
