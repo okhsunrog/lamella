@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -23,14 +27,20 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt,rust-src
           rustup +1.95.0 target add riscv32imc-unknown-none-elf
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            firmware-c3 -> target
+
       - name: Check host formatting
         run: cargo +1.95.0 fmt --all -- --check
 
       - name: Lint host and ICD
-        run: cargo +1.95.0 clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo +1.95.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test host and ICD
-        run: cargo +1.95.0 test --workspace --all-features
+        run: cargo +1.95.0 test --workspace --all-features --locked
 
       - name: Check ESP32-C3 formatting
         working-directory: firmware-c3
@@ -41,4 +51,37 @@ jobs:
         env:
           WIFI_SSID: ci-placeholder
           WIFI_PASSWORD: ci-placeholder
-        run: cargo +1.95.0 build --release --bin firmware-c3
+        run: cargo +1.95.0 build --release --bin firmware-c3 --locked
+
+  esp32-s3:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware-s3
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WIFI_SSID: ci-placeholder
+      WIFI_PASSWORD: ci-placeholder
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust for Xtensa
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          buildtargets: esp32s3
+          ldproxy: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware-s3
+
+      - name: Check ESP32-S3 formatting
+        run: cargo +esp fmt -- --check
+
+      - name: Lint ESP32-S3 firmware
+        run: cargo +esp clippy --release --bin firmware --locked -- -D warnings
+
+      - name: Build ESP32-S3 firmware
+        run: cargo +esp build --release --bin firmware --locked
