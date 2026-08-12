@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-and-c3:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libudev-dev
+
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt,rust-src
+
+      - name: Check host formatting
+        run: cargo +1.95.0 fmt --all -- --check
+
+      - name: Lint host and ICD
+        run: cargo +1.95.0 clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test host and ICD
+        run: cargo +1.95.0 test --workspace --all-features
+
+      - name: Check ESP32-C3 formatting
+        working-directory: firmware-c3
+        run: cargo +1.95.0 fmt -- --check
+
+      - name: Build ESP32-C3 firmware
+        working-directory: firmware-c3
+        env:
+          WIFI_SSID: ci-placeholder
+          WIFI_PASSWORD: ci-placeholder
+        run: cargo +1.95.0 build --release --bin firmware-c3
