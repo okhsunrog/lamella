@@ -116,6 +116,25 @@ The counters cover errors visible to the host bridge. Internal Ergot decoder
 errors that are only emitted as library log messages are not currently exposed
 as a numeric metric.
 
+### Isolated load testing
+
+Run sustained traffic through Lamella without changing the laptop's routes,
+DNS, VPN, or primary connection by placing the host and TAP interface in a
+separate network namespace:
+
+```bash
+cargo build -p host --release
+sudo DURATION_SECONDS=1800 ./scripts/netns-load-test.sh
+```
+
+The script obtains DHCP inside the namespace, then runs two concurrent HTTPS
+downloads, an HTTPS upload loop, continuous gateway ping, a packet capture, and
+optional firmware RTT capture. Results are written to a timestamped directory
+under `/tmp`. The namespace and all child processes are removed on normal exit,
+failure, Ctrl-C, or SIGTERM. Workload sizes and paths can be overridden with
+`DOWNLOAD_BYTES`, `UPLOAD_BYTES`, `RESULT_DIR`, `HOST_BINARY`, and
+`FIRMWARE_ELF`.
+
 ## Dependencies
 
 Built on [ergot](https://github.com/jamesmunns/ergot) — a transport-agnostic messaging library that runs on everything from PCs to tiny `no_std` microcontrollers. Provides type-safe sockets, addressing, and routing.
