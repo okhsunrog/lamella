@@ -143,9 +143,25 @@ ip netns exec "$NAMESPACE" ip link show dev esp32tap >/dev/null 2>&1 || {
     exit 1
 }
 
-log "Obtaining an isolated DHCP lease"
-ip netns exec "$NAMESPACE" dhcpcd -4 -1 -p -t 45 \
-    -C resolv.conf -C hostname esp32tap >"$RESULT_DIR/dhcp.log" 2>&1
+log "Starting DHCP lease management inside the namespace"
+ip netns exec "$NAMESPACE" dhcpcd -4 -B -d -t 0 \
+    -C resolv.conf -C hostname esp32tap >"$RESULT_DIR/dhcp.log" 2>&1 &
+CHILD_PIDS+=("$!")
+
+for _ in {1..450}; do
+    ip netns exec "$NAMESPACE" ip -4 address show dev esp32tap | \
+        grep -q 'inet ' && break
+    kill -0 "${CHILD_PIDS[-1]}" 2>/dev/null || {
+        log "DHCP client exited before obtaining an address"
+        exit 1
+    }
+    sleep 0.1
+done
+ip netns exec "$NAMESPACE" ip -4 address show dev esp32tap | \
+    grep -q 'inet ' || {
+        log "Timed out waiting for an IPv4 DHCP lease"
+        exit 1
+    }
 ip netns exec "$NAMESPACE" ip -details address show dev esp32tap >"$RESULT_DIR/netns-address.txt"
 ip netns exec "$NAMESPACE" ip -4 route show table all >"$RESULT_DIR/netns-routes.txt"
 
@@ -189,6 +205,9 @@ download_worker() {
         fi
         jq -c --arg started_at "$started_at" --arg finished_at "$finished_at" \
             '. + {started_at: $started_at, finished_at: $finished_at}' <<<"$result" >>"$output"
+        if jq -e '.curl_exit != 0 and .time_seconds < 1' <<<"$result" >/dev/null; then
+            sleep 1
+        fi
     done
 }
 
@@ -214,6 +233,9 @@ upload_worker() {
         fi
         jq -c --arg started_at "$started_at" --arg finished_at "$finished_at" \
             '. + {started_at: $started_at, finished_at: $finished_at}' <<<"$result" >>"$output"
+        if jq -e '.curl_exit != 0 and .time_seconds < 1' <<<"$result" >/dev/null; then
+            sleep 1
+        fi
     done
 }
 
