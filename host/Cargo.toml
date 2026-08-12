@@ -8,7 +8,7 @@ default-run = "host"
 [dependencies]
 ergot = { git = "https://github.com/jamesmunns/ergot", rev = "5a5fab8234339ecdc252e18c41ef2676bd6bb091", features = ["nusb-v0_1", "tokio-serial-v5"] }
 icd = { path = "../icd" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time", "sync", "signal"] }
 log = "0.4"
 env_logger = "0.11"
 postcard-schema = { version = "0.2", features = ["derive"] }

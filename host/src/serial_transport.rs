@@ -14,7 +14,7 @@ use tokio::{select, sync::mpsc, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tun_rs::AsyncDevice;
 
-use crate::{bridge, create_tap_interface, log_mac};
+use crate::{bridge, create_tap_interface, log_mac, metrics::BridgeMetrics};
 
 const MAX_ERGOT_PACKET_SIZE: u16 = 2048;
 const TX_BUFFER_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
@@ -26,20 +26,21 @@ pub async fn run(
     by_id: Option<&str>,
     baud: u32,
     cancel: CancellationToken,
+    metrics: Arc<BridgeMetrics>,
 ) -> io::Result<()> {
     match (port, by_id) {
         (Some(port), None) => {
             // Direct port mode - no hot-plug
-            run_with_port(port, baud, cancel).await
+            run_with_port(port, baud, cancel, metrics).await
         }
         (None, Some(pattern)) => {
             // Hot-plug mode using /dev/serial/by-id/
-            run_with_hotplug(pattern, baud, cancel).await
+            run_with_hotplug(pattern, baud, cancel, metrics).await
         }
         (Some(port), Some(_)) => {
             // If both provided, prefer direct port
             warn!("Both --port and --by-id provided, using --port");
-            run_with_port(port, baud, cancel).await
+            run_with_port(port, baud, cancel, metrics).await
         }
         (None, None) => Err(io::Error::other(
             "Either --port or --by-id must be provided",
@@ -48,7 +49,12 @@ pub async fn run(
 }
 
 /// Run with a fixed port path (no hot-plug)
-async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::Result<()> {
+async fn run_with_port(
+    port: &str,
+    baud: u32,
+    cancel: CancellationToken,
+    metrics: Arc<BridgeMetrics>,
+) -> io::Result<()> {
     let stack: RouterStack = RouterStack::new();
 
     info!(
@@ -77,13 +83,19 @@ async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::
     // Ergot request path.
     let (tap_tx, tap_rx) = mpsc::channel(1);
     let ping_handle = tokio::spawn(ping_listener(stack.clone(), cancel.clone()));
-    let tap_reader_handle = tokio::spawn(tap_reader(tap_device.clone(), tap_tx, cancel.clone()));
+    let tap_reader_handle = tokio::spawn(tap_reader(
+        tap_device.clone(),
+        tap_tx,
+        cancel.clone(),
+        metrics.clone(),
+    ));
     let exchange_handle = tokio::spawn(wifi_exchange(
         stack,
         tap_device,
         peer,
         tap_rx,
         cancel.clone(),
+        metrics,
     ));
 
     // Wait for cancellation
@@ -97,9 +109,15 @@ async fn run_with_port(port: &str, baud: u32, cancel: CancellationToken) -> io::
 }
 
 /// Run with hot-plug support using /dev/serial/by-id/ pattern matching
-async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -> io::Result<()> {
+async fn run_with_hotplug(
+    pattern: &str,
+    baud: u32,
+    cancel: CancellationToken,
+    metrics: Arc<BridgeMetrics>,
+) -> io::Result<()> {
     let mut expected_mac: Option<[u8; 6]> = None;
     let mut tap_device: Option<Arc<AsyncDevice>> = None;
+    let mut connected_once = false;
 
     info!(
         "Hot-plug mode enabled, watching for devices matching: {}",
@@ -179,6 +197,11 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
 
                         if let Some(ref tap) = tap_device {
                             info!("Starting bridge...");
+                            if connected_once {
+                                metrics.record_reconnect();
+                            } else {
+                                connected_once = true;
+                            }
 
                             // Create a child cancellation token for this session
                             let session_cancel = cancel.child_token();
@@ -191,6 +214,7 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
                                 tap.clone(),
                                 tap_tx,
                                 session_cancel.clone(),
+                                metrics.clone(),
                             ));
                             let exchange_handle = tokio::spawn(wifi_exchange(
                                 stack,
@@ -198,6 +222,7 @@ async fn run_with_hotplug(pattern: &str, baud: u32, cancel: CancellationToken) -
                                 peer,
                                 tap_rx,
                                 session_cancel.clone(),
+                                metrics.clone(),
                             ));
 
                             // Wait for either global cancellation or any task to complete
@@ -291,6 +316,7 @@ async fn tap_reader(
     tap_device: Arc<AsyncDevice>,
     tx: mpsc::Sender<WifiFrame>,
     cancel: CancellationToken,
+    metrics: Arc<BridgeMetrics>,
 ) {
     info!("TAP reader started");
 
@@ -308,9 +334,11 @@ async fn tap_reader(
                         if frame_data.extend_from_slice(&buf[..n]).is_err() {
                             continue;
                         }
+                        metrics.record_tap_rx(n);
                         WifiFrame { data: frame_data }
                     }
                     Err(e) => {
+                        metrics.record_tap_error();
                         error!("TAP read error: {:?}", e);
                         sleep(Duration::from_millis(100)).await;
                         continue;
@@ -345,6 +373,7 @@ async fn wifi_exchange(
     peer: Address,
     mut tap_rx: mpsc::Receiver<WifiFrame>,
     cancel: CancellationToken,
+    metrics: Arc<BridgeMetrics>,
 ) {
     info!("WiFi exchange task started");
     let session = serial_session_id();
@@ -366,13 +395,22 @@ async fn wifi_exchange(
                 select! {
                     result = response => match result {
                         Ok(response) if response.transaction == transaction => break,
-                        Ok(response) => warn!(
-                            "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
-                            transaction, response.transaction
-                        ),
-                        Err(e) => warn!("WiFi TX request failed: {:?}", e),
+                        Ok(response) => {
+                            metrics.record_tx_retry();
+                            metrics.record_response_mismatch();
+                            warn!(
+                                "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
+                                transaction, response.transaction
+                            );
+                        }
+                        Err(e) => {
+                            metrics.record_tx_retry();
+                            metrics.record_endpoint_error();
+                            warn!("WiFi TX request failed: {:?}", e);
+                        }
                     },
                     _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                        metrics.record_tx_retry();
                         warn!("WiFi TX response timed out; retrying transaction {:?}", transaction);
                     }
                     _ = cancel.cancelled() => {
@@ -398,19 +436,33 @@ async fn wifi_exchange(
                 result = response => match result {
                     Ok(response) if response.transaction == transaction => {
                         if let Some(frame) = response.frame
-                            && let Err(e) = tap_device.send(&frame.data).await
                         {
-                            error!("TAP write error: {:?}", e);
+                            match tap_device.send(&frame.data).await {
+                                Ok(bytes) => metrics.record_tap_tx(bytes),
+                                Err(e) => {
+                                    metrics.record_tap_error();
+                                    error!("TAP write error: {:?}", e);
+                                }
+                            }
                         }
                         break;
                     }
-                    Ok(response) => warn!(
-                        "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
-                        transaction, response.transaction
-                    ),
-                    Err(e) => warn!("WiFi RX request failed: {:?}", e),
+                    Ok(response) => {
+                        metrics.record_rx_retry();
+                        metrics.record_response_mismatch();
+                        warn!(
+                            "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
+                            transaction, response.transaction
+                        );
+                    }
+                    Err(e) => {
+                        metrics.record_rx_retry();
+                        metrics.record_endpoint_error();
+                        warn!("WiFi RX request failed: {:?}", e);
+                    }
                 },
                 _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                    metrics.record_rx_retry();
                     warn!("WiFi RX response timed out; retrying transaction {:?}", transaction);
                 }
                 _ = cancel.cancelled() => {

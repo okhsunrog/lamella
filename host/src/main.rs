@@ -1,12 +1,14 @@
 use clap::{Parser, Subcommand};
 use log::info;
-use std::{io, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 
 mod bridge;
+mod metrics;
 mod nusb_transport;
 mod serial_transport;
+mod system_network;
 mod test_mode;
 
 const TAP_MTU: u16 = 1478; // 1492-byte WiFi MTU minus 14-byte Ethernet header
@@ -33,6 +35,18 @@ struct Cli {
     /// Run HTTP download test (requires --test). Format: IP:PORT/path (e.g., 10.77.77.100:8080/file.bin)
     #[arg(long, global = true)]
     http: Option<String>,
+
+    /// Configure DHCP, the default IPv4 route, and DNS through NetworkManager.
+    #[arg(long, global = true, conflicts_with = "test")]
+    system_network: bool,
+
+    /// Metric assigned to DHCP routes in --system-network mode.
+    #[arg(long, global = true, default_value_t = 5)]
+    route_metric: u32,
+
+    /// Append periodic and final bridge counters as JSON Lines.
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "test")]
+    metrics_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -65,23 +79,41 @@ async fn main() -> io::Result<()> {
     let cancel_clone = cancel.clone();
 
     tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                info!("Received Ctrl-C, shutting down...");
-                cancel_clone.cancel();
-            }
-            Err(e) => {
-                eprintln!("Failed to listen for Ctrl-C: {}", e);
-            }
-        }
+        shutdown_signal().await;
+        info!("Received shutdown signal, shutting down...");
+        cancel_clone.cancel();
     });
+
+    let metrics = Arc::new(metrics::BridgeMetrics::default());
+    let metrics_handle = if cli.test {
+        None
+    } else {
+        Some(tokio::spawn(metrics::report(
+            metrics.clone(),
+            cli.metrics_file,
+            cancel.clone(),
+        )))
+    };
+    let network_handle = if cli.system_network {
+        let network_cancel = cancel.clone();
+        Some(tokio::spawn(async move {
+            let result = system_network::run(cli.route_metric, network_cancel.clone()).await;
+            if let Err(err) = &result {
+                log::error!("System network setup failed: {err}");
+                network_cancel.cancel();
+            }
+            result
+        }))
+    } else {
+        None
+    };
 
     let result = match cli.transport {
         Transport::Nusb => {
             if cli.test {
-                nusb_transport::run_test_mode(cancel, cli.bandwidth, cli.http).await
+                nusb_transport::run_test_mode(cancel.clone(), cli.bandwidth, cli.http).await
             } else {
-                nusb_transport::run(cancel).await
+                nusb_transport::run(cancel.clone(), metrics.clone()).await
             }
         }
         Transport::Serial { port, by_id, baud } => {
@@ -90,19 +122,61 @@ async fn main() -> io::Result<()> {
                     port.as_deref(),
                     by_id.as_deref(),
                     baud,
-                    cancel,
+                    cancel.clone(),
                     cli.bandwidth,
                     cli.http,
                 )
                 .await
             } else {
-                serial_transport::run(port.as_deref(), by_id.as_deref(), baud, cancel).await
+                serial_transport::run(
+                    port.as_deref(),
+                    by_id.as_deref(),
+                    baud,
+                    cancel.clone(),
+                    metrics.clone(),
+                )
+                .await
             }
         }
     };
 
+    cancel.cancel();
+    if let Some(handle) = network_handle {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if result.is_ok() => return Err(err),
+            Ok(Err(err)) => log::warn!("System network cleanup failed: {err}"),
+            Err(err) => log::warn!("System network task failed: {err}"),
+        }
+    }
+    if let Some(handle) = metrics_handle {
+        let _ = handle.await;
+    }
+
     info!("Application exiting");
     result
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(err) = result {
+                log::error!("Failed to listen for Ctrl-C: {err}");
+            }
+        }
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        log::error!("Failed to listen for Ctrl-C: {err}");
+    }
 }
 
 /// Create and configure the TAP interface with the given MAC address
