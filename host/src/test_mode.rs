@@ -398,12 +398,10 @@ pub async fn run_tcp_bandwidth_test(
         // Handle TCP state
         let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
-        if tcp_started && !tcp_connected && tcp_socket.is_active() {
-            if tcp_socket.may_recv() {
-                info!("TCP connected! Starting download...");
-                tcp_connected = true;
-                start_time = Some(std::time::Instant::now());
-            }
+        if tcp_started && !tcp_connected && tcp_socket.is_active() && tcp_socket.may_recv() {
+            info!("TCP connected! Starting download...");
+            tcp_connected = true;
+            start_time = Some(std::time::Instant::now());
         }
 
         // Receive data
@@ -673,6 +671,7 @@ pub async fn run_http_download_test(
     let mut body_bytes: u64 = 0;
     let mut start_time: Option<std::time::Instant> = None;
     let mut last_report = std::time::Instant::now();
+    let mut last_state_log: Option<std::time::Instant> = None;
     let mut header_buf = Vec::new();
 
     info!("Waiting for DHCP...");
@@ -732,9 +731,7 @@ pub async fn run_http_download_test(
         let tcp_socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
         // Debug: log TCP state periodically
-        static mut LAST_STATE_LOG: Option<std::time::Instant> = None;
-        let should_log =
-            unsafe { LAST_STATE_LOG.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) };
+        let should_log = last_state_log.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
         if tcp_started && !tcp_connected && should_log {
             info!(
                 "TCP state: {:?}, can_send={}, can_recv={}",
@@ -742,16 +739,12 @@ pub async fn run_http_download_test(
                 tcp_socket.may_send(),
                 tcp_socket.may_recv()
             );
-            unsafe {
-                LAST_STATE_LOG = Some(std::time::Instant::now());
-            }
+            last_state_log = Some(std::time::Instant::now());
         }
 
-        if tcp_started && !tcp_connected && tcp_socket.is_active() {
-            if tcp_socket.may_recv() {
-                info!("TCP connected!");
-                tcp_connected = true;
-            }
+        if tcp_started && !tcp_connected && tcp_socket.is_active() && tcp_socket.may_recv() {
+            info!("TCP connected!");
+            tcp_connected = true;
         }
 
         // Send HTTP request
@@ -1025,7 +1018,7 @@ fn serial_session_id() -> u64 {
 fn log_frame(direction: &str, count: u64, frame: &[u8]) {
     // Reduce logging frequency to avoid CPU contention
     // Only log every 100th frame, or non-TCP frames
-    let should_log = count % 100 == 0;
+    let should_log = count.is_multiple_of(100);
     if !should_log {
         return;
     }

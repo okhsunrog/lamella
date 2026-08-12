@@ -3,6 +3,7 @@ name = "host"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+default-run = "host"
 
 [dependencies]
 ergot = { git = "https://github.com/jamesmunns/ergot", rev = "5a5fab8234339ecdc252e18c41ef2676bd6bb091", features = ["nusb-v0_1", "tokio-serial-v5"] }
