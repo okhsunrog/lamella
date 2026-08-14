@@ -21,6 +21,7 @@ readonly BROWSE_INTERVAL_SECONDS="${BROWSE_INTERVAL_SECONDS:-20}"
 readonly REALISTIC_UPLOAD_BYTES="${REALISTIC_UPLOAD_BYTES:-192000}"
 readonly UPLOAD_INTERVAL_SECONDS="${UPLOAD_INTERVAL_SECONDS:-45}"
 readonly DNS_INTERVAL_SECONDS="${DNS_INTERVAL_SECONDS:-15}"
+readonly CAPTURE_FIRMWARE_RTT="${CAPTURE_FIRMWARE_RTT:-1}"
 readonly RESULT_DIR="${RESULT_DIR:-/tmp/lamella-load-test-$(date -u +%Y%m%dT%H%M%SZ)}"
 readonly HOST_BINARY="${HOST_BINARY:-$REPO_DIR/target/release/host}"
 readonly FIRMWARE_ELF="${FIRMWARE_ELF:-$REPO_DIR/firmware-c3/target/riscv32imc-unknown-none-elf/release/firmware-c3}"
@@ -104,6 +105,14 @@ case "$WORKLOAD_PROFILE" in
         ;;
 esac
 
+case "$CAPTURE_FIRMWARE_RTT" in
+    0 | 1) ;;
+    *)
+        log "CAPTURE_FIRMWARE_RTT must be 0 or 1"
+        exit 1
+        ;;
+esac
+
 [[ -x "$HOST_BINARY" ]] || {
     log "Host binary not found: $HOST_BINARY"
     log "Build it with: cargo build -p host --release"
@@ -129,6 +138,7 @@ jq -n \
     --arg namespace "$NAMESPACE" \
     --arg device_pattern "$DEVICE_PATTERN" \
     --arg workload_profile "$WORKLOAD_PROFILE" \
+    --argjson capture_firmware_rtt "$CAPTURE_FIRMWARE_RTT" \
     --arg cloudflare_ip "$CLOUDFLARE_IP" \
     --argjson duration_seconds "$DURATION_SECONDS" \
     --argjson download_bytes "$DOWNLOAD_BYTES" \
@@ -140,7 +150,8 @@ jq -n \
     --argjson upload_interval_seconds "$UPLOAD_INTERVAL_SECONDS" \
     --argjson dns_interval_seconds "$DNS_INTERVAL_SECONDS" \
     '{started_at: $started_at, namespace: $namespace, device_pattern: $device_pattern,
-      workload_profile: $workload_profile, cloudflare_ip: $cloudflare_ip,
+      workload_profile: $workload_profile, capture_firmware_rtt: $capture_firmware_rtt,
+      cloudflare_ip: $cloudflare_ip,
       duration_seconds: $duration_seconds, download_bytes: $download_bytes,
       upload_bytes: $upload_bytes,
       realistic: {video_rate_bytes_per_second: $video_rate_bytes_per_second,
@@ -214,12 +225,13 @@ ip netns exec "$NAMESPACE" ping -D -n -i "$PING_INTERVAL" -W 3 10.77.77.1 \
     >"$RESULT_DIR/ping.log" 2>&1 &
 CHILD_PIDS+=("$!")
 
-if [[ -x "$PROBE_RS_BINARY" ]] && [[ -f "$FIRMWARE_ELF" ]]; then
+if [[ "$CAPTURE_FIRMWARE_RTT" == 1 ]] && \
+    [[ -x "$PROBE_RS_BINARY" ]] && [[ -f "$FIRMWARE_ELF" ]]; then
     "$PROBE_RS_BINARY" attach --chip esp32c3 "$FIRMWARE_ELF" \
         >"$RESULT_DIR/firmware.log" 2>&1 &
     CHILD_PIDS+=("$!")
 else
-    log "Firmware RTT capture skipped: probe-rs or firmware ELF unavailable"
+    log "Firmware RTT capture skipped"
 fi
 
 END_TIME=$((SECONDS + DURATION_SECONDS))

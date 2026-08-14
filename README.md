@@ -150,6 +150,18 @@ traffic shape can be adjusted with `VIDEO_RATE_BYTES_PER_SECOND`,
 `BROWSE_INTERVAL_SECONDS`, `UPLOAD_INTERVAL_SECONDS`, and
 `DNS_INTERVAL_SECONDS`.
 
+To exercise repeated host disconnect/reconnect cycles without resetting the
+firmware, run:
+
+```bash
+sudo CYCLES=10 SESSION_DURATION_SECONDS=180 \
+  ./scripts/netns-warm-restart-test.sh
+```
+
+The warm-restart test keeps one continuous firmware RTT capture while creating
+and tearing down an isolated realistic-load session for each cycle. Its result
+directory contains the individual session artifacts and a `summary.tsv` file.
+
 ## Dependencies
 
 Built on [ergot](https://github.com/jamesmunns/ergot) — a transport-agnostic messaging library that runs on everything from PCs to tiny `no_std` microcontrollers. Provides type-safe sockets, addressing, and routing.
