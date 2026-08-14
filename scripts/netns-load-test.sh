@@ -13,6 +13,10 @@ readonly DOWNLOAD_BYTES="${DOWNLOAD_BYTES:-5000000}"
 readonly UPLOAD_BYTES="${UPLOAD_BYTES:-2000000}"
 readonly VIDEO_RATE_BYTES_PER_SECOND="${VIDEO_RATE_BYTES_PER_SECOND:-62500}"
 readonly VIDEO_SEGMENT_BYTES="${VIDEO_SEGMENT_BYTES:-2000000}"
+readonly VIDEO_SEGMENT_DEADLINE_SECONDS="$((
+    (VIDEO_SEGMENT_BYTES + VIDEO_RATE_BYTES_PER_SECOND - 1) /
+    VIDEO_RATE_BYTES_PER_SECOND + 10
+))"
 readonly BROWSE_INTERVAL_SECONDS="${BROWSE_INTERVAL_SECONDS:-20}"
 readonly REALISTIC_UPLOAD_BYTES="${REALISTIC_UPLOAD_BYTES:-192000}"
 readonly UPLOAD_INTERVAL_SECONDS="${UPLOAD_INTERVAL_SECONDS:-45}"
@@ -297,8 +301,9 @@ realistic_video_worker() {
     while (( SECONDS < END_TIME )); do
         local started_at finished_at result remaining request_timeout
         remaining=$((END_TIME - SECONDS))
-        # Do not begin a segment that the harness deadline would cut short.
-        (( remaining >= 10 )) || break
+        # Include transfer time plus connection/setup headroom so the harness
+        # deadline does not cut the final rate-limited segment short.
+        (( remaining >= VIDEO_SEGMENT_DEADLINE_SECONDS )) || break
         request_timeout=$((remaining < 120 ? remaining : 120))
         (( request_timeout > 0 )) || break
         started_at="$(date -u +%FT%TZ)"
