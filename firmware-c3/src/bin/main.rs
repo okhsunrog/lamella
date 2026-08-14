@@ -20,7 +20,7 @@ use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex as CsMutex,
     channel::{Channel, TrySendError},
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async_0_7::Write;
 use ergot::{
     DEFAULT_TTL, FrameKind, Header, NetStackSendError,
@@ -79,7 +79,7 @@ static STACK: Stack = kit::new_target_stack(OUTQ.stream_producer(), MAX_PACKET_S
 static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
 static WIFI_TO_HOST_CHANNEL: Channel<CsMutex, WifiFrame, 64> = Channel::new();
 static HOST_TO_WIFI_CHANNEL: Channel<CsMutex, WifiFrame, 1> = Channel::new();
-static WIFI_TX_COMPLETE_CHANNEL: Channel<CsMutex, (), 1> = Channel::new();
+static WIFI_TX_COMPLETE_CHANNEL: Channel<CsMutex, u64, 1> = Channel::new();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -254,8 +254,17 @@ async fn wifi_tx_server() {
 
         let transaction = request.t.transaction;
         if last_completed != Some(transaction) {
+            let started = Instant::now();
             HOST_TO_WIFI_CHANNEL.send(request.t.frame).await;
-            WIFI_TX_COMPLETE_CHANNEL.receive().await;
+            let queue_wait_ms = started.elapsed().as_millis();
+            let radio_wait_ms = WIFI_TX_COMPLETE_CHANNEL.receive().await;
+            let total_wait_ms = started.elapsed().as_millis();
+            if total_wait_ms >= 250 {
+                warn!(
+                    "WiFi TX transaction id={} stalled: total={}ms queue={}ms radio={}ms",
+                    transaction.id, total_wait_ms, queue_wait_ms, radio_wait_ms
+                );
+            }
             last_completed = Some(transaction);
         }
         send_tx_response(&response_header, &WifiTxResponse { transaction }).await;
@@ -437,9 +446,12 @@ async fn queue_wifi_frame_while_serving_tx(
         match select(ready_to_send, HOST_TO_WIFI_CHANNEL.receive()).await {
             Either::First(()) => {}
             Either::Second(host_frame) => {
+                let started = Instant::now();
                 transmit_only_to_wifi(wifi_device, &host_frame).await;
                 host_frames_transmitted += 1;
-                WIFI_TX_COMPLETE_CHANNEL.send(()).await;
+                WIFI_TX_COMPLETE_CHANNEL
+                    .send(started.elapsed().as_millis())
+                    .await;
             }
         }
     }
@@ -506,10 +518,13 @@ async fn wifi_bridge(mut wifi_device: WifiInterface) {
             Either::First(frame) => {
                 // Host -> WiFi: wait until the radio accepts the frame.
                 host_rx_count += 1;
+                let started = Instant::now();
                 let (received, pending_rx) = transmit_to_wifi(&mut wifi_device, &frame).await;
                 wifi_rx_count += received;
                 wifi_tx_ok += 1;
-                WIFI_TX_COMPLETE_CHANNEL.send(()).await;
+                WIFI_TX_COMPLETE_CHANNEL
+                    .send(started.elapsed().as_millis())
+                    .await;
 
                 if let Some(frame) = pending_rx {
                     let transmitted =
