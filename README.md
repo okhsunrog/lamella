@@ -136,6 +136,20 @@ failure, Ctrl-C, or SIGTERM. Workload sizes and paths can be overridden with
 `DOWNLOAD_BYTES`, `UPLOAD_BYTES`, `RESULT_DIR`, `HOST_BINARY`, and
 `FIRMWARE_ELF`.
 
+For a less synthetic workload shaped like ordinary laptop use, run:
+
+```bash
+sudo DURATION_SECONDS=1800 ./scripts/netns-realistic-test.sh
+```
+
+This keeps a bandwidth-limited video-like download active while adding short
+web-style download bursts, periodic small uploads, DNS lookups, and a one-second
+ping probe. It uses the same isolated namespace and captures the same host,
+firmware, packet, and bridge metrics, plus per-workload JSONL files. The default
+traffic shape can be adjusted with `VIDEO_RATE_BYTES_PER_SECOND`,
+`BROWSE_INTERVAL_SECONDS`, `UPLOAD_INTERVAL_SECONDS`, and
+`DNS_INTERVAL_SECONDS`.
+
 ## Dependencies
 
 Built on [ergot](https://github.com/jamesmunns/ergot) — a transport-agnostic messaging library that runs on everything from PCs to tiny `no_std` microcontrollers. Provides type-safe sockets, addressing, and routing.
