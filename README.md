@@ -104,8 +104,8 @@ prevents an unrelated IPv6 route from bypassing the test.
 The host logs cumulative bridge counters every 60 seconds and once more during
 clean shutdown. They include frames and bytes in both directions, request
 retries, slow-request counts and durations, endpoint errors, response
-mismatches, TAP errors, and transport reconnections. Append the same snapshots
-as JSON Lines for later analysis with:
+mismatches, TAP errors, transport reconnections, and recovery timeouts. Append
+the same snapshots as JSON Lines for later analysis with:
 
 ```bash
 sudo ./target/release/host --system-network \
@@ -161,6 +161,21 @@ sudo CYCLES=10 SESSION_DURATION_SECONDS=180 \
 The warm-restart test keeps one continuous firmware RTT capture while creating
 and tearing down an isolated realistic-load session for each cycle. Its result
 directory contains the individual session artifacts and a `summary.tsv` file.
+
+The serial recovery path can be tested deterministically by dropping both the
+primary request and its backup once:
+
+```bash
+sudo env LAMELLA_TEST_DROP_ENDPOINT_REQUESTS=2 \
+  LAMELLA_TEST_DROP_ENDPOINT_DIRECTION=rx DURATION_SECONDS=120 \
+  ./scripts/netns-realistic-test.sh
+```
+
+After the five-second recovery deadline, hot-plug mode recreates the serial
+transport and continues with the existing TAP interface. The fault budget is
+process-wide, so it is exhausted before the replacement session starts.
+`LAMELLA_TEST_DROP_ENDPOINT_DIRECTION` accepts `rx`, `tx`, or `any` (the
+default).
 
 ## Dependencies
 

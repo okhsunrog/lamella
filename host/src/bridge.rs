@@ -33,6 +33,12 @@ pub struct EndpointWaitResult<T> {
     pub discarded_errors: u8,
 }
 
+pub enum EndpointWaitOutcome<T> {
+    Completed(EndpointWaitResult<T>),
+    RecoveryRequired { stalled_for: Duration },
+    Cancelled,
+}
+
 /// Await one Ergot request while retaining its response socket on a slow peer.
 ///
 /// One idempotent backup request covers a request or response lost before the
@@ -45,7 +51,34 @@ pub async fn await_endpoint_response<F, B, M, T>(
     direction: &'static str,
     transaction: WifiTransaction,
     cancel: &CancellationToken,
-) -> Option<EndpointWaitResult<T>>
+    recovery_timeout: Option<Duration>,
+) -> EndpointWaitOutcome<T>
+where
+    F: Future<Output = Result<T, ReqRespError>>,
+    B: Future<Output = Result<T, ReqRespError>>,
+    M: FnOnce() -> B,
+{
+    await_endpoint_response_with_timeouts(
+        primary,
+        make_backup,
+        direction,
+        transaction,
+        cancel,
+        ENDPOINT_STALL_THRESHOLD,
+        recovery_timeout,
+    )
+    .await
+}
+
+async fn await_endpoint_response_with_timeouts<F, B, M, T>(
+    primary: F,
+    make_backup: M,
+    direction: &'static str,
+    transaction: WifiTransaction,
+    cancel: &CancellationToken,
+    stall_threshold: Duration,
+    recovery_timeout: Option<Duration>,
+) -> EndpointWaitOutcome<T>
 where
     F: Future<Output = Result<T, ReqRespError>>,
     B: Future<Output = Result<T, ReqRespError>>,
@@ -53,12 +86,19 @@ where
 {
     let started = Instant::now();
     let mut primary = pin!(primary);
-    let warning = sleep(ENDPOINT_STALL_THRESHOLD);
+    let warning = sleep(stall_threshold);
     let mut warning = pin!(warning);
+    let recovery_deadline = async {
+        match recovery_timeout {
+            Some(duration) => sleep(duration).await,
+            None => std::future::pending().await,
+        }
+    };
+    let mut recovery_deadline = pin!(recovery_deadline);
 
     select! {
         result = &mut primary => {
-            return Some(EndpointWaitResult {
+            return EndpointWaitOutcome::Completed(EndpointWaitResult {
                 result,
                 stalled_for: None,
                 backup_sent: false,
@@ -66,7 +106,12 @@ where
             });
         }
         _ = &mut warning => {}
-        _ = cancel.cancelled() => return None,
+        _ = &mut recovery_deadline => {
+            return EndpointWaitOutcome::RecoveryRequired {
+                stalled_for: started.elapsed(),
+            };
+        }
+        _ = cancel.cancelled() => return EndpointWaitOutcome::Cancelled,
     }
 
     warn!(
@@ -88,6 +133,11 @@ where
         select! {
             result = &mut primary => break ResponseSource::Primary(result),
             result = &mut backup => break ResponseSource::Backup(result),
+            _ = &mut recovery_deadline => {
+                return EndpointWaitOutcome::RecoveryRequired {
+                    stalled_for: started.elapsed(),
+                };
+            }
             _ = &mut warning => {
                 warn!(
                     "{direction} response still pending after {}ms for transaction {:?}",
@@ -96,13 +146,13 @@ where
                 );
                 warning.as_mut().reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
             }
-            _ = cancel.cancelled() => return None,
+            _ = cancel.cancelled() => return EndpointWaitOutcome::Cancelled,
         }
     };
 
     let result = match first {
         ResponseSource::Primary(Ok(response)) | ResponseSource::Backup(Ok(response)) => {
-            return Some(EndpointWaitResult {
+            return EndpointWaitOutcome::Completed(EndpointWaitResult {
                 result: Ok(response),
                 stalled_for: Some(started.elapsed()),
                 backup_sent: true,
@@ -114,6 +164,11 @@ where
             loop {
                 select! {
                     result = &mut backup => break result,
+                    _ = &mut recovery_deadline => {
+                        return EndpointWaitOutcome::RecoveryRequired {
+                            stalled_for: started.elapsed(),
+                        };
+                    }
                     _ = &mut warning => {
                         warn!(
                             "{direction} backup response still pending after {}ms for transaction {:?}",
@@ -122,7 +177,7 @@ where
                         );
                         warning.as_mut().reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
                     }
-                    _ = cancel.cancelled() => return None,
+                    _ = cancel.cancelled() => return EndpointWaitOutcome::Cancelled,
                 }
             }
         }
@@ -131,6 +186,11 @@ where
             loop {
                 select! {
                     result = &mut primary => break result,
+                    _ = &mut recovery_deadline => {
+                        return EndpointWaitOutcome::RecoveryRequired {
+                            stalled_for: started.elapsed(),
+                        };
+                    }
                     _ = &mut warning => {
                         warn!(
                             "{direction} primary response still pending after {}ms for transaction {:?}",
@@ -139,13 +199,13 @@ where
                         );
                         warning.as_mut().reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
                     }
-                    _ = cancel.cancelled() => return None,
+                    _ = cancel.cancelled() => return EndpointWaitOutcome::Cancelled,
                 }
             }
         }
     };
 
-    Some(EndpointWaitResult {
+    EndpointWaitOutcome::Completed(EndpointWaitResult {
         result,
         stalled_for: Some(started.elapsed()),
         backup_sent: true,
@@ -290,27 +350,31 @@ mod tests {
         let cancel = CancellationToken::new();
         let transaction = WifiTransaction { session: 7, id: 9 };
 
-        let result = await_endpoint_response(
+        let result = await_endpoint_response_with_timeouts(
             async {
-                sleep(Duration::from_millis(300)).await;
+                sleep(Duration::from_millis(30)).await;
                 Ok(42)
             },
             || async {
-                sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(50)).await;
                 Ok(43)
             },
             "test",
             transaction,
             &cancel,
+            Duration::from_millis(10),
+            Some(Duration::from_millis(100)),
         )
         .await;
 
-        let result = result.expect("request should complete");
+        let EndpointWaitOutcome::Completed(result) = result else {
+            panic!("request should complete");
+        };
         assert_eq!(result.result, Ok(42));
         assert!(
             result
                 .stalled_for
-                .is_some_and(|duration| duration >= ENDPOINT_STALL_THRESHOLD)
+                .is_some_and(|duration| duration >= Duration::from_millis(10))
         );
         assert!(result.backup_sent);
         assert_eq!(result.discarded_errors, 0);
@@ -321,7 +385,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let transaction = WifiTransaction { session: 7, id: 10 };
 
-        let result = await_endpoint_response(
+        let result = await_endpoint_response_with_timeouts(
             std::future::pending(),
             || async {
                 sleep(Duration::from_millis(10)).await;
@@ -330,13 +394,62 @@ mod tests {
             "test",
             transaction,
             &cancel,
+            Duration::from_millis(10),
+            Some(Duration::from_millis(100)),
         )
-        .await
-        .expect("backup should complete");
+        .await;
 
+        let EndpointWaitOutcome::Completed(result) = result else {
+            panic!("backup should complete");
+        };
         assert_eq!(result.result, Ok(43));
         assert!(result.stalled_for.is_some());
         assert!(result.backup_sent);
         assert_eq!(result.discarded_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_is_required_when_primary_and_backup_are_lost() {
+        let cancel = CancellationToken::new();
+        let transaction = WifiTransaction { session: 7, id: 11 };
+
+        let result = await_endpoint_response_with_timeouts::<_, _, _, ()>(
+            std::future::pending(),
+            std::future::pending,
+            "test",
+            transaction,
+            &cancel,
+            Duration::from_millis(5),
+            Some(Duration::from_millis(30)),
+        )
+        .await;
+
+        let EndpointWaitOutcome::RecoveryRequired { stalled_for } = result else {
+            panic!("lost primary and backup should require recovery");
+        };
+        assert!(stalled_for >= Duration::from_millis(30));
+    }
+
+    #[tokio::test]
+    async fn disabled_recovery_waits_for_cancellation() {
+        let cancel = CancellationToken::new();
+        let cancel_request = cancel.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(20)).await;
+            cancel_request.cancel();
+        });
+
+        let result = await_endpoint_response_with_timeouts::<_, _, _, ()>(
+            std::future::pending(),
+            std::future::pending,
+            "test",
+            WifiTransaction { session: 7, id: 12 },
+            &cancel,
+            Duration::from_millis(5),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, EndpointWaitOutcome::Cancelled));
     }
 }

@@ -307,7 +307,7 @@ async fn wifi_exchange(
                 let response = stack
                     .endpoints()
                     .request::<WifiTxEndpoint>(peer, &request, None);
-                let Some(wait) = bridge::await_endpoint_response(
+                let wait = match bridge::await_endpoint_response(
                     response,
                     || {
                         stack
@@ -317,11 +317,18 @@ async fn wifi_exchange(
                     "WiFi TX",
                     transaction,
                     &cancel,
+                    None,
                 )
                 .await
-                else {
-                    info!("WiFi exchange task shutting down");
-                    return;
+                {
+                    bridge::EndpointWaitOutcome::Completed(wait) => wait,
+                    bridge::EndpointWaitOutcome::Cancelled => {
+                        info!("WiFi exchange task shutting down");
+                        return;
+                    }
+                    bridge::EndpointWaitOutcome::RecoveryRequired { .. } => {
+                        unreachable!("NUSB endpoint recovery timeout is disabled")
+                    }
                 };
                 if wait.backup_sent {
                     metrics.record_tx_retry();
@@ -363,7 +370,7 @@ async fn wifi_exchange(
             let response = stack
                 .endpoints()
                 .request::<WifiRxEndpoint>(peer, &request, None);
-            let Some(wait) = bridge::await_endpoint_response(
+            let wait = match bridge::await_endpoint_response(
                 response,
                 || {
                     stack
@@ -373,11 +380,18 @@ async fn wifi_exchange(
                 "WiFi RX",
                 transaction,
                 &cancel,
+                None,
             )
             .await
-            else {
-                info!("WiFi exchange task shutting down");
-                return;
+            {
+                bridge::EndpointWaitOutcome::Completed(wait) => wait,
+                bridge::EndpointWaitOutcome::Cancelled => {
+                    info!("WiFi exchange task shutting down");
+                    return;
+                }
+                bridge::EndpointWaitOutcome::RecoveryRequired { .. } => {
+                    unreachable!("NUSB endpoint recovery timeout is disabled")
+                }
             };
             if wait.backup_sent {
                 metrics.record_rx_retry();

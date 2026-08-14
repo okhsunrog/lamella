@@ -9,7 +9,16 @@ use icd::{
     WifiTxEndpoint, WifiTxRequest,
 };
 use log::{error, info, trace, warn};
-use std::{io, path::Path, pin::pin, sync::Arc, time::Duration};
+use std::{
+    io,
+    path::Path,
+    pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{select, sync::mpsc, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tun_rs::AsyncDevice;
@@ -19,6 +28,96 @@ use crate::{bridge, create_tap_interface, log_mac, metrics::BridgeMetrics};
 const MAX_ERGOT_PACKET_SIZE: u16 = 2048;
 const TX_BUFFER_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
 const DEVICE_POLL_INTERVAL_MS: u64 = 500;
+const ENDPOINT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const FAULT_DROP_REQUESTS_ENV: &str = "LAMELLA_TEST_DROP_ENDPOINT_REQUESTS";
+const FAULT_DIRECTION_ENV: &str = "LAMELLA_TEST_DROP_ENDPOINT_DIRECTION";
+
+#[derive(Clone, Copy)]
+enum EndpointFaultDirection {
+    Any,
+    Tx,
+    Rx,
+}
+
+impl EndpointFaultDirection {
+    fn from_env() -> Self {
+        match std::env::var(FAULT_DIRECTION_ENV).as_deref() {
+            Ok("tx") => Self::Tx,
+            Ok("rx") => Self::Rx,
+            Ok("any") | Err(_) => Self::Any,
+            Ok(value) => {
+                warn!("Ignoring invalid {FAULT_DIRECTION_ENV}={value:?}; expected any, tx, or rx");
+                Self::Any
+            }
+        }
+    }
+
+    fn matches(self, direction: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Tx => direction.starts_with("WiFi TX"),
+            Self::Rx => direction.starts_with("WiFi RX"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EndpointFaultInjector {
+    remaining: Arc<AtomicUsize>,
+    direction: EndpointFaultDirection,
+}
+
+impl EndpointFaultInjector {
+    fn from_env() -> Self {
+        let remaining = std::env::var(FAULT_DROP_REQUESTS_ENV)
+            .ok()
+            .and_then(|value| match value.parse::<usize>() {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    warn!("Ignoring invalid {FAULT_DROP_REQUESTS_ENV}={value:?}: {err}");
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if remaining > 0 {
+            warn!(
+                "Endpoint fault injection enabled: dropping the next {remaining} serial requests"
+            );
+        }
+        Self {
+            remaining: Arc::new(AtomicUsize::new(remaining)),
+            direction: EndpointFaultDirection::from_env(),
+        }
+    }
+
+    fn should_drop(&self, direction: &str, transaction: WifiTransaction) -> bool {
+        if !self.direction.matches(direction) {
+            return false;
+        }
+        let dropped = self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        if dropped {
+            warn!(
+                "Fault injection: dropping {direction} request for transaction {:?}",
+                transaction
+            );
+        }
+        dropped
+    }
+}
+
+impl Default for EndpointFaultInjector {
+    fn default() -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(0)),
+            direction: EndpointFaultDirection::Any,
+        }
+    }
+}
 
 pub async fn run(
     port: Option<&str>,
@@ -27,19 +126,20 @@ pub async fn run(
     cancel: CancellationToken,
     metrics: Arc<BridgeMetrics>,
 ) -> io::Result<()> {
+    let fault_injector = EndpointFaultInjector::from_env();
     match (port, by_id) {
         (Some(port), None) => {
             // Direct port mode - no hot-plug
-            run_with_port(port, baud, cancel, metrics).await
+            run_with_port(port, baud, cancel, metrics, fault_injector).await
         }
         (None, Some(pattern)) => {
             // Hot-plug mode using /dev/serial/by-id/
-            run_with_hotplug(pattern, baud, cancel, metrics).await
+            run_with_hotplug(pattern, baud, cancel, metrics, fault_injector).await
         }
         (Some(port), Some(_)) => {
             // If both provided, prefer direct port
             warn!("Both --port and --by-id provided, using --port");
-            run_with_port(port, baud, cancel, metrics).await
+            run_with_port(port, baud, cancel, metrics, fault_injector).await
         }
         (None, None) => Err(io::Error::other(
             "Either --port or --by-id must be provided",
@@ -53,6 +153,7 @@ async fn run_with_port(
     baud: u32,
     cancel: CancellationToken,
     metrics: Arc<BridgeMetrics>,
+    fault_injector: EndpointFaultInjector,
 ) -> io::Result<()> {
     let stack: RouterStack = RouterStack::new();
 
@@ -80,31 +181,41 @@ async fn run_with_port(
 
     // A reader queues TAP frames while one exchange task exclusively owns the
     // Ergot request path.
+    let session_cancel = cancel.child_token();
     let (tap_tx, tap_rx) = mpsc::channel(1);
-    let ping_handle = tokio::spawn(ping_listener(stack.clone(), cancel.clone()));
-    let tap_reader_handle = tokio::spawn(tap_reader(
+    let _ping_handle = tokio::spawn(ping_listener(stack.clone(), session_cancel.clone()));
+    let _tap_reader_handle = tokio::spawn(tap_reader(
         tap_device.clone(),
         tap_tx,
-        cancel.clone(),
+        session_cancel.clone(),
         metrics.clone(),
     ));
-    let exchange_handle = tokio::spawn(wifi_exchange(
-        stack,
+    let mut exchange_handle = tokio::spawn(wifi_exchange(
+        stack.clone(),
         tap_device,
         peer,
         tap_rx,
-        cancel.clone(),
+        session_cancel.clone(),
         metrics,
+        fault_injector,
     ));
 
-    // Wait for cancellation
-    cancel.cancelled().await;
-
-    // Wait for bridge tasks to finish
-    let _ = tokio::join!(ping_handle, tap_reader_handle, exchange_handle);
+    let exchange_ended = select! {
+        _ = cancel.cancelled() => false,
+        _ = &mut exchange_handle => true,
+    };
+    session_cancel.cancel();
+    deregister_serial_interface(&stack, interface_id);
 
     info!("Serial transport shut down complete");
-    Ok(())
+    if exchange_ended {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Serial exchange ended; restart the direct-port host session",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Run with hot-plug support using /dev/serial/by-id/ pattern matching
@@ -113,6 +224,7 @@ async fn run_with_hotplug(
     baud: u32,
     cancel: CancellationToken,
     metrics: Arc<BridgeMetrics>,
+    fault_injector: EndpointFaultInjector,
 ) -> io::Result<()> {
     let mut expected_mac: Option<[u8; 6]> = None;
     let mut tap_device: Option<Arc<AsyncDevice>> = None;
@@ -216,12 +328,13 @@ async fn run_with_hotplug(
                                 metrics.clone(),
                             ));
                             let exchange_handle = tokio::spawn(wifi_exchange(
-                                stack,
+                                stack.clone(),
                                 tap.clone(),
                                 peer,
                                 tap_rx,
                                 session_cancel.clone(),
                                 metrics.clone(),
+                                fault_injector.clone(),
                             ));
 
                             // Wait for either global cancellation or any task to complete
@@ -244,6 +357,9 @@ async fn run_with_hotplug(
                                 }
                             }
 
+                            session_cancel.cancel();
+                            deregister_serial_interface(&stack, interface_id);
+
                             // Check if we were cancelled globally
                             if cancel.is_cancelled() {
                                 return Ok(());
@@ -262,6 +378,15 @@ async fn run_with_hotplug(
 
         info!("Device disconnected, waiting for reconnection...");
         sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn deregister_serial_interface(stack: &RouterStack, interface_id: u8) {
+    if let Err(err) = stack.manage_profile(|profile| profile.deregister_interface(interface_id)) {
+        warn!(
+            "Failed to deregister serial interface {interface_id}: {:?}",
+            err
+        );
     }
 }
 
@@ -373,6 +498,7 @@ async fn wifi_exchange(
     mut tap_rx: mpsc::Receiver<WifiFrame>,
     cancel: CancellationToken,
     metrics: Arc<BridgeMetrics>,
+    fault_injector: EndpointFaultInjector,
 ) {
     info!("WiFi exchange task started");
     let session = serial_session_id();
@@ -388,24 +514,56 @@ async fn wifi_exchange(
             let request = WifiTxRequest { transaction, frame };
 
             loop {
-                let response = stack
-                    .endpoints()
-                    .request::<WifiTxEndpoint>(peer, &request, None);
-                let Some(wait) = bridge::await_endpoint_response(
-                    response,
-                    || {
+                let drop_primary = fault_injector.should_drop("WiFi TX", transaction);
+                let response = async {
+                    if drop_primary {
+                        std::future::pending().await
+                    } else {
                         stack
                             .endpoints()
                             .request::<WifiTxEndpoint>(peer, &request, None)
+                            .await
+                    }
+                };
+                let wait = match bridge::await_endpoint_response(
+                    response,
+                    || {
+                        let drop_backup = fault_injector.should_drop("WiFi TX backup", transaction);
+                        let stack = &stack;
+                        let request = &request;
+                        async move {
+                            if drop_backup {
+                                std::future::pending().await
+                            } else {
+                                stack
+                                    .endpoints()
+                                    .request::<WifiTxEndpoint>(peer, request, None)
+                                    .await
+                            }
+                        }
                     },
                     "WiFi TX",
                     transaction,
                     &cancel,
+                    Some(ENDPOINT_RECOVERY_TIMEOUT),
                 )
                 .await
-                else {
-                    info!("WiFi exchange task shutting down");
-                    return;
+                {
+                    bridge::EndpointWaitOutcome::Completed(wait) => wait,
+                    bridge::EndpointWaitOutcome::Cancelled => {
+                        info!("WiFi exchange task shutting down");
+                        return;
+                    }
+                    bridge::EndpointWaitOutcome::RecoveryRequired { stalled_for } => {
+                        metrics.record_tx_retry();
+                        metrics.record_tx_stall(stalled_for);
+                        metrics.record_recovery_timeout();
+                        error!(
+                            "WiFi TX did not respond to the primary or backup request within {}ms; recycling serial transport",
+                            stalled_for.as_millis()
+                        );
+                        return;
+                    }
                 };
                 if wait.backup_sent {
                     metrics.record_tx_retry();
@@ -443,24 +601,56 @@ async fn wifi_exchange(
         let request = WifiRxRequest { transaction };
 
         loop {
-            let response = stack
-                .endpoints()
-                .request::<WifiRxEndpoint>(peer, &request, None);
-            let Some(wait) = bridge::await_endpoint_response(
-                response,
-                || {
+            let drop_primary = fault_injector.should_drop("WiFi RX", transaction);
+            let response = async {
+                if drop_primary {
+                    std::future::pending().await
+                } else {
                     stack
                         .endpoints()
                         .request::<WifiRxEndpoint>(peer, &request, None)
+                        .await
+                }
+            };
+            let wait = match bridge::await_endpoint_response(
+                response,
+                || {
+                    let drop_backup = fault_injector.should_drop("WiFi RX backup", transaction);
+                    let stack = &stack;
+                    let request = &request;
+                    async move {
+                        if drop_backup {
+                            std::future::pending().await
+                        } else {
+                            stack
+                                .endpoints()
+                                .request::<WifiRxEndpoint>(peer, request, None)
+                                .await
+                        }
+                    }
                 },
                 "WiFi RX",
                 transaction,
                 &cancel,
+                Some(ENDPOINT_RECOVERY_TIMEOUT),
             )
             .await
-            else {
-                info!("WiFi exchange task shutting down");
-                return;
+            {
+                bridge::EndpointWaitOutcome::Completed(wait) => wait,
+                bridge::EndpointWaitOutcome::Cancelled => {
+                    info!("WiFi exchange task shutting down");
+                    return;
+                }
+                bridge::EndpointWaitOutcome::RecoveryRequired { stalled_for } => {
+                    metrics.record_rx_retry();
+                    metrics.record_rx_stall(stalled_for);
+                    metrics.record_recovery_timeout();
+                    error!(
+                        "WiFi RX did not respond to the primary or backup request within {}ms; recycling serial transport",
+                        stalled_for.as_millis()
+                    );
+                    return;
+                }
             };
             if wait.backup_sent {
                 metrics.record_rx_retry();

@@ -75,7 +75,7 @@ fi
 mkdir -p "$RESULT_ROOT"
 exec > >(tee -a "$RESULT_ROOT/orchestrator.log") 2>&1
 
-printf 'cycle\texit\ttx_retries\trx_retries\ttx_stalls\trx_stalls\tendpoint_errors\treconnects\tvideo_ok\tvideo_total\tbrowse_ok\tbrowse_total\tupload_ok\tupload_total\thost_warnings\n' \
+printf 'cycle\texit\ttx_retries\trx_retries\ttx_stalls\trx_stalls\tendpoint_errors\treconnects\trecovery_timeouts\tvideo_ok\tvideo_total\tbrowse_ok\tbrowse_total\tupload_ok\tupload_total\thost_warnings\n' \
     >"$RESULT_ROOT/summary.tsv"
 
 log "Starting continuous firmware RTT capture without resetting the device"
@@ -116,10 +116,10 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     CURRENT_SESSION_PID=""
     set -e
 
-    metrics=$'0\t0\t0\t0\t0\t0'
+    metrics=$'0\t0\t0\t0\t0\t0\t0'
     if [[ -s "$cycle_dir/metrics.jsonl" ]]; then
         metrics="$(jq -r -s \
-            'last | [.tx_retries, .rx_retries, .tx_stalls, .rx_stalls, .endpoint_errors, .reconnects] | @tsv' \
+            'last | [.tx_retries, .rx_retries, .tx_stalls, .rx_stalls, .endpoint_errors, .reconnects, (.recovery_timeouts // 0)] | @tsv' \
             "$cycle_dir/metrics.jsonl")"
     fi
     video="$(request_counts "$cycle_dir/video.jsonl")"
