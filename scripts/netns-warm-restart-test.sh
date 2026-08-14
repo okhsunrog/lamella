@@ -127,8 +127,7 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     upload="$(request_counts "$cycle_dir/realistic-upload.jsonl")"
     host_warnings="$(
         grep -E 'WARN|ERROR' "$cycle_dir/host.log" 2>/dev/null |
-            grep -Ev 'NoRoute|Ping listener ended' |
-            wc -l || true
+            grep -Evc 'NoRoute|Ping listener ended' || true
     )"
     host_warnings="${host_warnings:-0}"
 
