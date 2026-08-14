@@ -23,7 +23,6 @@ use crate::{bridge, create_tap_interface, log_mac, metrics::BridgeMetrics};
 
 const MTU: u16 = 2048;
 const OUT_BUFFER_SIZE: usize = 65536; // 64KB for bursty WiFi traffic
-const REQUEST_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub async fn run(cancel: CancellationToken, metrics: Arc<BridgeMetrics>) -> io::Result<()> {
     let stack: RouterStack = RouterStack::new();
@@ -308,30 +307,30 @@ async fn wifi_exchange(
                 let response = stack
                     .endpoints()
                     .request::<WifiTxEndpoint>(peer, &request, None);
-                select! {
-                    result = response => match result {
-                        Ok(response) if response.transaction == transaction => break,
-                        Ok(response) => {
-                            metrics.record_tx_retry();
-                            metrics.record_response_mismatch();
-                            warn!(
-                                "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
-                                transaction, response.transaction
-                            );
-                        }
-                        Err(e) => {
-                            metrics.record_tx_retry();
-                            metrics.record_endpoint_error();
-                            warn!("WiFi TX request failed: {:?}", e);
-                        }
-                    },
-                    _ = sleep(REQUEST_RETRY_TIMEOUT) => {
+                let Some((result, stalled_for)) =
+                    bridge::await_endpoint_response(response, "WiFi TX", transaction, &cancel)
+                        .await
+                else {
+                    info!("WiFi exchange task shutting down");
+                    return;
+                };
+                if let Some(duration) = stalled_for {
+                    metrics.record_tx_stall(duration);
+                }
+                match result {
+                    Ok(response) if response.transaction == transaction => break,
+                    Ok(response) => {
                         metrics.record_tx_retry();
-                        warn!("WiFi TX response timed out; retrying transaction {:?}", transaction);
+                        metrics.record_response_mismatch();
+                        warn!(
+                            "Ignoring stale WiFi TX response: expected {:?}, got {:?}",
+                            transaction, response.transaction
+                        );
                     }
-                    _ = cancel.cancelled() => {
-                        info!("WiFi exchange task shutting down");
-                        return;
+                    Err(e) => {
+                        metrics.record_tx_retry();
+                        metrics.record_endpoint_error();
+                        warn!("WiFi TX request failed: {:?}", e);
                     }
                 }
             }
@@ -349,42 +348,40 @@ async fn wifi_exchange(
             let response = stack
                 .endpoints()
                 .request::<WifiRxEndpoint>(peer, &request, None);
-            select! {
-                result = response => match result {
-                    Ok(response) if response.transaction == transaction => {
-                        if let Some(frame) = response.frame
-                        {
-                            match tap_device.send(&frame.data).await {
-                                Ok(bytes) => metrics.record_tap_tx(bytes),
-                                Err(e) => {
-                                    metrics.record_tap_error();
-                                    error!("TAP write error: {:?}", e);
-                                }
+            let Some((result, stalled_for)) =
+                bridge::await_endpoint_response(response, "WiFi RX", transaction, &cancel).await
+            else {
+                info!("WiFi exchange task shutting down");
+                return;
+            };
+            if let Some(duration) = stalled_for {
+                metrics.record_rx_stall(duration);
+            }
+            match result {
+                Ok(response) if response.transaction == transaction => {
+                    if let Some(frame) = response.frame {
+                        match tap_device.send(&frame.data).await {
+                            Ok(bytes) => metrics.record_tap_tx(bytes),
+                            Err(e) => {
+                                metrics.record_tap_error();
+                                error!("TAP write error: {:?}", e);
                             }
                         }
-                        break;
                     }
-                    Ok(response) => {
-                        metrics.record_rx_retry();
-                        metrics.record_response_mismatch();
-                        warn!(
-                            "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
-                            transaction, response.transaction
-                        );
-                    }
-                    Err(e) => {
-                        metrics.record_rx_retry();
-                        metrics.record_endpoint_error();
-                        warn!("WiFi RX request failed: {:?}", e);
-                    }
-                },
-                _ = sleep(REQUEST_RETRY_TIMEOUT) => {
-                    metrics.record_rx_retry();
-                    warn!("WiFi RX response timed out; retrying transaction {:?}", transaction);
+                    break;
                 }
-                _ = cancel.cancelled() => {
-                    info!("WiFi exchange task shutting down");
-                    return;
+                Ok(response) => {
+                    metrics.record_rx_retry();
+                    metrics.record_response_mismatch();
+                    warn!(
+                        "Ignoring stale WiFi RX response: expected {:?}, got {:?}",
+                        transaction, response.transaction
+                    );
+                }
+                Err(e) => {
+                    metrics.record_rx_retry();
+                    metrics.record_endpoint_error();
+                    warn!("WiFi RX request failed: {:?}", e);
                 }
             }
         }

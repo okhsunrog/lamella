@@ -103,8 +103,9 @@ prevents an unrelated IPv6 route from bypassing the test.
 
 The host logs cumulative bridge counters every 60 seconds and once more during
 clean shutdown. They include frames and bytes in both directions, request
-retries, endpoint errors, response mismatches, TAP errors, and transport
-reconnections. Append the same snapshots as JSON Lines for later analysis with:
+retries, slow-request counts and durations, endpoint errors, response
+mismatches, TAP errors, and transport reconnections. Append the same snapshots
+as JSON Lines for later analysis with:
 
 ```bash
 sudo ./target/release/host --system-network \

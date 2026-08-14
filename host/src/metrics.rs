@@ -18,6 +18,12 @@ pub struct BridgeMetrics {
     tap_tx_bytes: AtomicU64,
     tx_retries: AtomicU64,
     rx_retries: AtomicU64,
+    tx_stalls: AtomicU64,
+    tx_stall_ms: AtomicU64,
+    tx_stall_max_ms: AtomicU64,
+    rx_stalls: AtomicU64,
+    rx_stall_ms: AtomicU64,
+    rx_stall_max_ms: AtomicU64,
     endpoint_errors: AtomicU64,
     response_mismatches: AtomicU64,
     tap_errors: AtomicU64,
@@ -32,6 +38,12 @@ struct Snapshot {
     tap_tx_bytes: u64,
     tx_retries: u64,
     rx_retries: u64,
+    tx_stalls: u64,
+    tx_stall_ms: u64,
+    tx_stall_max_ms: u64,
+    rx_stalls: u64,
+    rx_stall_ms: u64,
+    rx_stall_max_ms: u64,
     endpoint_errors: u64,
     response_mismatches: u64,
     tap_errors: u64,
@@ -55,6 +67,20 @@ impl BridgeMetrics {
 
     pub fn record_rx_retry(&self) {
         self.rx_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tx_stall(&self, duration: Duration) {
+        let millis = duration.as_millis() as u64;
+        self.tx_stalls.fetch_add(1, Ordering::Relaxed);
+        self.tx_stall_ms.fetch_add(millis, Ordering::Relaxed);
+        self.tx_stall_max_ms.fetch_max(millis, Ordering::Relaxed);
+    }
+
+    pub fn record_rx_stall(&self, duration: Duration) {
+        let millis = duration.as_millis() as u64;
+        self.rx_stalls.fetch_add(1, Ordering::Relaxed);
+        self.rx_stall_ms.fetch_add(millis, Ordering::Relaxed);
+        self.rx_stall_max_ms.fetch_max(millis, Ordering::Relaxed);
     }
 
     pub fn record_endpoint_error(&self) {
@@ -81,6 +107,12 @@ impl BridgeMetrics {
             tap_tx_bytes: self.tap_tx_bytes.load(Ordering::Relaxed),
             tx_retries: self.tx_retries.load(Ordering::Relaxed),
             rx_retries: self.rx_retries.load(Ordering::Relaxed),
+            tx_stalls: self.tx_stalls.load(Ordering::Relaxed),
+            tx_stall_ms: self.tx_stall_ms.load(Ordering::Relaxed),
+            tx_stall_max_ms: self.tx_stall_max_ms.load(Ordering::Relaxed),
+            rx_stalls: self.rx_stalls.load(Ordering::Relaxed),
+            rx_stall_ms: self.rx_stall_ms.load(Ordering::Relaxed),
+            rx_stall_max_ms: self.rx_stall_max_ms.load(Ordering::Relaxed),
             endpoint_errors: self.endpoint_errors.load(Ordering::Relaxed),
             response_mismatches: self.response_mismatches.load(Ordering::Relaxed),
             tap_errors: self.tap_errors.load(Ordering::Relaxed),
@@ -117,7 +149,7 @@ fn emit(metrics: &BridgeMetrics, uptime: Duration, final_report: bool, output: O
         "Bridge metrics"
     };
     info!(
-        "{label} (uptime {:.0}s): TAP->WiFi {} frames / {:.2} MiB, WiFi->TAP {} frames / {:.2} MiB, retries TX={} RX={}, endpoint_errors={}, mismatches={}, tap_errors={}, reconnects={}",
+        "{label} (uptime {:.0}s): TAP->WiFi {} frames / {:.2} MiB, WiFi->TAP {} frames / {:.2} MiB, retries TX={} RX={}, stalls TX={} (total={}ms max={}ms) RX={} (total={}ms max={}ms), endpoint_errors={}, mismatches={}, tap_errors={}, reconnects={}",
         uptime.as_secs_f64(),
         stats.tap_rx_frames,
         stats.tap_rx_bytes as f64 / 1_048_576.0,
@@ -125,6 +157,12 @@ fn emit(metrics: &BridgeMetrics, uptime: Duration, final_report: bool, output: O
         stats.tap_tx_bytes as f64 / 1_048_576.0,
         stats.tx_retries,
         stats.rx_retries,
+        stats.tx_stalls,
+        stats.tx_stall_ms,
+        stats.tx_stall_max_ms,
+        stats.rx_stalls,
+        stats.rx_stall_ms,
+        stats.rx_stall_max_ms,
         stats.endpoint_errors,
         stats.response_mismatches,
         stats.tap_errors,
@@ -137,7 +175,7 @@ fn emit(metrics: &BridgeMetrics, uptime: Duration, final_report: bool, output: O
             .unwrap_or_default()
             .as_secs();
         let line = format!(
-            "{{\"timestamp\":{timestamp},\"uptime_seconds\":{},\"final\":{final_report},\"tap_to_wifi_frames\":{},\"tap_to_wifi_bytes\":{},\"wifi_to_tap_frames\":{},\"wifi_to_tap_bytes\":{},\"tx_retries\":{},\"rx_retries\":{},\"endpoint_errors\":{},\"response_mismatches\":{},\"tap_errors\":{},\"reconnects\":{}}}\n",
+            "{{\"timestamp\":{timestamp},\"uptime_seconds\":{},\"final\":{final_report},\"tap_to_wifi_frames\":{},\"tap_to_wifi_bytes\":{},\"wifi_to_tap_frames\":{},\"wifi_to_tap_bytes\":{},\"tx_retries\":{},\"rx_retries\":{},\"tx_stalls\":{},\"tx_stall_ms\":{},\"tx_stall_max_ms\":{},\"rx_stalls\":{},\"rx_stall_ms\":{},\"rx_stall_max_ms\":{},\"endpoint_errors\":{},\"response_mismatches\":{},\"tap_errors\":{},\"reconnects\":{}}}\n",
             uptime.as_secs(),
             stats.tap_rx_frames,
             stats.tap_rx_bytes,
@@ -145,6 +183,12 @@ fn emit(metrics: &BridgeMetrics, uptime: Duration, final_report: bool, output: O
             stats.tap_tx_bytes,
             stats.tx_retries,
             stats.rx_retries,
+            stats.tx_stalls,
+            stats.tx_stall_ms,
+            stats.tx_stall_max_ms,
+            stats.rx_stalls,
+            stats.rx_stall_ms,
+            stats.rx_stall_max_ms,
             stats.endpoint_errors,
             stats.response_mismatches,
             stats.tap_errors,

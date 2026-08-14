@@ -11,11 +11,60 @@ use ergot::{
     },
 };
 use icd::GetMacEndpoint;
-use log::info;
-use std::{io, time::Duration};
-use tokio::time::{sleep, timeout};
+use icd::WifiTransaction;
+use log::{info, warn};
+use std::{future::Future, io, pin::pin, time::Duration};
+use tokio::{
+    select,
+    time::{Instant, sleep, timeout},
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{ESP32_NODE_ID, MAC_QUERY_RETRIES, MAC_QUERY_RETRY_DELAY_MS, MAC_QUERY_TIMEOUT_MS};
+
+const ENDPOINT_STALL_THRESHOLD: Duration = Duration::from_millis(250);
+const ENDPOINT_STALL_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Await one Ergot request without dropping its response socket on a slow peer.
+///
+/// Dropping and recreating the request future on a timeout gives every retry a
+/// new response port. A late response is then undeliverable, while duplicate
+/// requests fill the remote bounded endpoint. Keep the original future alive
+/// and use the timer only for stall diagnostics.
+pub async fn await_endpoint_response<F>(
+    response: F,
+    direction: &'static str,
+    transaction: WifiTransaction,
+    cancel: &CancellationToken,
+) -> Option<(F::Output, Option<Duration>)>
+where
+    F: Future,
+{
+    let started = Instant::now();
+    let mut response = pin!(response);
+    let warning = sleep(ENDPOINT_STALL_THRESHOLD);
+    let mut warning = pin!(warning);
+    let mut stalled = false;
+
+    loop {
+        select! {
+            result = &mut response => {
+                let elapsed = started.elapsed();
+                return Some((result, stalled.then_some(elapsed)));
+            }
+            _ = &mut warning => {
+                stalled = true;
+                warn!(
+                    "{direction} response still pending after {}ms for transaction {:?}",
+                    started.elapsed().as_millis(),
+                    transaction,
+                );
+                warning.as_mut().reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
+            }
+            _ = cancel.cancelled() => return None,
+        }
+    }
+}
 
 /// Query MAC address with retries (NUSB transport)
 pub async fn query_mac_with_retry_nusb(
@@ -143,4 +192,30 @@ async fn query_mac_for_interface_serial(
         .request::<GetMacEndpoint>(addr, &(), Some("mac"))
         .await
         .map_err(|err| io::Error::other(format!("{:?}", err)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_endpoint_response_is_not_replaced_after_warning() {
+        let cancel = CancellationToken::new();
+        let transaction = WifiTransaction { session: 7, id: 9 };
+
+        let result = await_endpoint_response(
+            async {
+                sleep(Duration::from_millis(300)).await;
+                42
+            },
+            "test",
+            transaction,
+            &cancel,
+        )
+        .await;
+
+        let (value, stalled_for) = result.expect("request should complete");
+        assert_eq!(value, 42);
+        assert!(stalled_for.is_some_and(|duration| duration >= ENDPOINT_STALL_THRESHOLD));
+    }
 }
