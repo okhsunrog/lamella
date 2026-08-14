@@ -5,6 +5,7 @@
 use ergot::{
     Address,
     interface_manager::{InterfaceState, Profile},
+    net_stack::ReqRespError,
     toolkits::{
         nusb_v0_1::RouterStack as NusbRouterStack,
         tokio_serial_v5::RouterStack as SerialRouterStack,
@@ -25,35 +26,69 @@ use crate::{ESP32_NODE_ID, MAC_QUERY_RETRIES, MAC_QUERY_RETRY_DELAY_MS, MAC_QUER
 const ENDPOINT_STALL_THRESHOLD: Duration = Duration::from_millis(250);
 const ENDPOINT_STALL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Await one Ergot request without dropping its response socket on a slow peer.
+pub struct EndpointWaitResult<T> {
+    pub result: Result<T, ReqRespError>,
+    pub stalled_for: Option<Duration>,
+    pub backup_sent: bool,
+    pub discarded_errors: u8,
+}
+
+/// Await one Ergot request while retaining its response socket on a slow peer.
 ///
-/// Dropping and recreating the request future on a timeout gives every retry a
-/// new response port. A late response is then undeliverable, while duplicate
-/// requests fill the remote bounded endpoint. Keep the original future alive
-/// and use the timer only for stall diagnostics.
-pub async fn await_endpoint_response<F>(
-    response: F,
+/// One idempotent backup request covers a request or response lost before the
+/// timeout. Both response sockets then remain alive, so a late response is
+/// still deliverable and the remote bounded endpoint can contain at most one
+/// duplicate instead of an unbounded retry storm.
+pub async fn await_endpoint_response<F, B, M, T>(
+    primary: F,
+    make_backup: M,
     direction: &'static str,
     transaction: WifiTransaction,
     cancel: &CancellationToken,
-) -> Option<(F::Output, Option<Duration>)>
+) -> Option<EndpointWaitResult<T>>
 where
-    F: Future,
+    F: Future<Output = Result<T, ReqRespError>>,
+    B: Future<Output = Result<T, ReqRespError>>,
+    M: FnOnce() -> B,
 {
     let started = Instant::now();
-    let mut response = pin!(response);
+    let mut primary = pin!(primary);
     let warning = sleep(ENDPOINT_STALL_THRESHOLD);
     let mut warning = pin!(warning);
-    let mut stalled = false;
 
-    loop {
+    select! {
+        result = &mut primary => {
+            return Some(EndpointWaitResult {
+                result,
+                stalled_for: None,
+                backup_sent: false,
+                discarded_errors: 0,
+            });
+        }
+        _ = &mut warning => {}
+        _ = cancel.cancelled() => return None,
+    }
+
+    warn!(
+        "{direction} response still pending after {}ms; sending one backup for transaction {:?}",
+        started.elapsed().as_millis(),
+        transaction,
+    );
+    warning
+        .as_mut()
+        .reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
+    let mut backup = pin!(make_backup());
+
+    enum ResponseSource<T> {
+        Primary(Result<T, ReqRespError>),
+        Backup(Result<T, ReqRespError>),
+    }
+
+    let first = loop {
         select! {
-            result = &mut response => {
-                let elapsed = started.elapsed();
-                return Some((result, stalled.then_some(elapsed)));
-            }
+            result = &mut primary => break ResponseSource::Primary(result),
+            result = &mut backup => break ResponseSource::Backup(result),
             _ = &mut warning => {
-                stalled = true;
                 warn!(
                     "{direction} response still pending after {}ms for transaction {:?}",
                     started.elapsed().as_millis(),
@@ -63,7 +98,59 @@ where
             }
             _ = cancel.cancelled() => return None,
         }
-    }
+    };
+
+    let result = match first {
+        ResponseSource::Primary(Ok(response)) | ResponseSource::Backup(Ok(response)) => {
+            return Some(EndpointWaitResult {
+                result: Ok(response),
+                stalled_for: Some(started.elapsed()),
+                backup_sent: true,
+                discarded_errors: 0,
+            });
+        }
+        ResponseSource::Primary(Err(err)) => {
+            warn!("{direction} primary request failed while backup is pending: {err:?}");
+            loop {
+                select! {
+                    result = &mut backup => break result,
+                    _ = &mut warning => {
+                        warn!(
+                            "{direction} backup response still pending after {}ms for transaction {:?}",
+                            started.elapsed().as_millis(),
+                            transaction,
+                        );
+                        warning.as_mut().reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
+                    }
+                    _ = cancel.cancelled() => return None,
+                }
+            }
+        }
+        ResponseSource::Backup(Err(err)) => {
+            warn!("{direction} backup request failed while primary is pending: {err:?}");
+            loop {
+                select! {
+                    result = &mut primary => break result,
+                    _ = &mut warning => {
+                        warn!(
+                            "{direction} primary response still pending after {}ms for transaction {:?}",
+                            started.elapsed().as_millis(),
+                            transaction,
+                        );
+                        warning.as_mut().reset(Instant::now() + ENDPOINT_STALL_LOG_INTERVAL);
+                    }
+                    _ = cancel.cancelled() => return None,
+                }
+            }
+        }
+    };
+
+    Some(EndpointWaitResult {
+        result,
+        stalled_for: Some(started.elapsed()),
+        backup_sent: true,
+        discarded_errors: 1,
+    })
 }
 
 /// Query MAC address with retries (NUSB transport)
@@ -206,7 +293,11 @@ mod tests {
         let result = await_endpoint_response(
             async {
                 sleep(Duration::from_millis(300)).await;
-                42
+                Ok(42)
+            },
+            || async {
+                sleep(Duration::from_millis(200)).await;
+                Ok(43)
             },
             "test",
             transaction,
@@ -214,8 +305,38 @@ mod tests {
         )
         .await;
 
-        let (value, stalled_for) = result.expect("request should complete");
-        assert_eq!(value, 42);
-        assert!(stalled_for.is_some_and(|duration| duration >= ENDPOINT_STALL_THRESHOLD));
+        let result = result.expect("request should complete");
+        assert_eq!(result.result, Ok(42));
+        assert!(
+            result
+                .stalled_for
+                .is_some_and(|duration| duration >= ENDPOINT_STALL_THRESHOLD)
+        );
+        assert!(result.backup_sent);
+        assert_eq!(result.discarded_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn backup_recovers_a_lost_primary_request() {
+        let cancel = CancellationToken::new();
+        let transaction = WifiTransaction { session: 7, id: 10 };
+
+        let result = await_endpoint_response(
+            std::future::pending(),
+            || async {
+                sleep(Duration::from_millis(10)).await;
+                Ok(43)
+            },
+            "test",
+            transaction,
+            &cancel,
+        )
+        .await
+        .expect("backup should complete");
+
+        assert_eq!(result.result, Ok(43));
+        assert!(result.stalled_for.is_some());
+        assert!(result.backup_sent);
+        assert_eq!(result.discarded_errors, 0);
     }
 }

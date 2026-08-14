@@ -391,17 +391,32 @@ async fn wifi_exchange(
                 let response = stack
                     .endpoints()
                     .request::<WifiTxEndpoint>(peer, &request, None);
-                let Some((result, stalled_for)) =
-                    bridge::await_endpoint_response(response, "WiFi TX", transaction, &cancel)
-                        .await
+                let Some(wait) = bridge::await_endpoint_response(
+                    response,
+                    || {
+                        stack
+                            .endpoints()
+                            .request::<WifiTxEndpoint>(peer, &request, None)
+                    },
+                    "WiFi TX",
+                    transaction,
+                    &cancel,
+                )
+                .await
                 else {
                     info!("WiFi exchange task shutting down");
                     return;
                 };
-                if let Some(duration) = stalled_for {
+                if wait.backup_sent {
+                    metrics.record_tx_retry();
+                }
+                for _ in 0..wait.discarded_errors {
+                    metrics.record_endpoint_error();
+                }
+                if let Some(duration) = wait.stalled_for {
                     metrics.record_tx_stall(duration);
                 }
-                match result {
+                match wait.result {
                     Ok(response) if response.transaction == transaction => break,
                     Ok(response) => {
                         metrics.record_tx_retry();
@@ -431,16 +446,32 @@ async fn wifi_exchange(
             let response = stack
                 .endpoints()
                 .request::<WifiRxEndpoint>(peer, &request, None);
-            let Some((result, stalled_for)) =
-                bridge::await_endpoint_response(response, "WiFi RX", transaction, &cancel).await
+            let Some(wait) = bridge::await_endpoint_response(
+                response,
+                || {
+                    stack
+                        .endpoints()
+                        .request::<WifiRxEndpoint>(peer, &request, None)
+                },
+                "WiFi RX",
+                transaction,
+                &cancel,
+            )
+            .await
             else {
                 info!("WiFi exchange task shutting down");
                 return;
             };
-            if let Some(duration) = stalled_for {
+            if wait.backup_sent {
+                metrics.record_rx_retry();
+            }
+            for _ in 0..wait.discarded_errors {
+                metrics.record_endpoint_error();
+            }
+            if let Some(duration) = wait.stalled_for {
                 metrics.record_rx_stall(duration);
             }
-            match result {
+            match wait.result {
                 Ok(response) if response.transaction == transaction => {
                     if let Some(frame) = response.frame {
                         match tap_device.send(&frame.data).await {
